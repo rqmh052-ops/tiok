@@ -1,4 +1,4 @@
-import os, re, time, logging, hashlib, hmac, threading, sqlite3, random, io, csv, json
+import os, re, time, logging, hashlib, hmac, threading, sqlite3, random, io, csv, json, asyncio
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -407,7 +407,9 @@ def db_get_avg_speed_per_follow(uid: int) -> float | None:
 # 8. تصدير قاعدة البيانات
 # ═══════════════════════════════════════════════════════════════════
 
-DB_EXPORT_KEY = os.environ.get("DB_EXPORT_KEY", "admin123")  # غيّره أو ضعه في env
+DB_EXPORT_KEY = os.environ.get("DB_EXPORT_KEY", "")
+if not DB_EXPORT_KEY:
+    raise RuntimeError("❌ DB_EXPORT_KEY غير موجود! export DB_EXPORT_KEY='مفتاح_قوي'")
 
 def export_db_csv(decryption_confirmed: bool = False) -> bytes:
     """تصدير جميع بيانات المستخدمين كـ CSV"""
@@ -498,7 +500,7 @@ def fetch_tiktok_user_info(pb: dict, sess) -> dict:
 
 
 def refresh_token(uid: int) -> bool:
-    """لا يوجد تجديد تلقائي — التوكن يجب تجديده يدوياً"""
+    """التجديد يدوي فقط — غير مستخدمة حالياً"""
     return False
 
 def check_jwt_token(token: str) -> tuple[bool, str, str]:
@@ -601,8 +603,21 @@ def collect_points(uid: int, bot):
 
     def send(text: str, kbd=True):
         try:
-            bot.send_message(chat_id=uid, text=text, parse_mode="Markdown",
-                             reply_markup=get_main_keyboard() if kbd else None)
+            import asyncio
+            loop = None
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            future = asyncio.run_coroutine_threadsafe(
+                bot.send_message(
+                    chat_id=uid, text=text, parse_mode="Markdown",
+                    reply_markup=get_main_keyboard() if kbd else None
+                ),
+                loop
+            )
+            future.result(timeout=10)
         except Exception as ex:
             log.warning(f"send [{uid}]: {ex}")
 
@@ -621,13 +636,8 @@ def collect_points(uid: int, bot):
                 # ── Fetch ──────────────────────────────────────────
                 r1 = sess.post(API_URL, json={"operationName":"FetchOrders","variables":{"page":2},"query":FETCH_Q}, headers=fh, timeout=12)
                 if r1.status_code == 401:
-                    send("⛔ *انتهى التوكن!* جاري التجديد التلقائي...", kbd=False)
-                    if refresh_token(uid):
-                        nu = db_get_user(uid)
-                        if nu and nu["token"]:
-                            token = nu["token"]; fh = fetch_headers(token); ah = action_headers(token)
-                            send("✅ *تم تجديد الجلسة تلقائياً!*", kbd=False); continue
-                    send("❌ *فشل التجديد.* يرجى /start", kbd=False); break
+                    send("⛔ *انتهى التوكن!* يرجى تجديده عبر زر 🔄 تغيير الحساب.", kbd=True)
+                    break
                 if r1.status_code != 200: raise ValueError(f"كود {r1.status_code}")
 
                 orders = r1.json().get("data",{}).get("getOrders",[])
@@ -639,11 +649,8 @@ def collect_points(uid: int, bot):
                 # ── Action ─────────────────────────────────────────
                 r2 = sess.post(API_URL,json={"operationName":"ActionOrder","variables":{"orderId":raw_oid,"validationData":{"attempts":1,"initialNumber":random.uniform(1000,5000),"timeSpent":random.randint(15000,45000)}},"query":ACTION_Q},headers=ah,timeout=12)
                 if r2.status_code == 401:
-                    if refresh_token(uid):
-                        nu = db_get_user(uid)
-                        if nu and nu["token"]:
-                            token = nu["token"]; fh = fetch_headers(token); ah = action_headers(token); continue
-                    send("❌ *فشل التجديد.*", kbd=False); break
+                    send("⛔ *انتهى التوكن!* يرجى تجديده عبر زر 🔄 تغيير الحساب.", kbd=True)
+                    break
                 if r2.status_code != 200: raise ValueError(f"Action كود {r2.status_code}")
 
                 res    = r2.json()
@@ -683,16 +690,27 @@ def collect_points(uid: int, bot):
 
             except ValueError as e:
                 errors += 1
+                log.warning(f"[{uid}] ValueError: {e}")
                 send(f"⚠️ خطأ `{e}` — أعيد المحاولة (#{errors})...")
+                if errors >= 20:
+                    send("🛑 *توقف تلقائي بعد 20 خطأ متتالي.* تحقق من حسابك.", kbd=True)
+                    break
                 time.sleep(2)
             except requests.Timeout:
                 errors += 1
+                log.warning(f"[{uid}] Timeout #{errors}")
                 send(f"⏱️ مهلة انتهت — إعادة (#{errors})...")
+                if errors >= 20:
+                    send("🛑 *توقف تلقائي بعد 20 timeout متتالي.*", kbd=True)
+                    break
                 time.sleep(3)
             except Exception as e:
                 errors += 1
                 log.exception(f"[{uid}] خطأ")
                 send(f"🔴 `{type(e).__name__}` — أعيد المحاولة...")
+                if errors >= 20:
+                    send("🛑 *توقف تلقائي بعد 20 خطأ.*", kbd=True)
+                    break
                 time.sleep(3)
     finally:
         with _threads_lock: _active_threads.pop(uid, None)
@@ -768,7 +786,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @only_allowed
 async def handle_token_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    import asyncio
     uid   = update.effective_user.id
     token = update.message.text.strip()
 
@@ -780,11 +797,17 @@ async def handle_token_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return AWAITING_TOKEN
 
     msg  = await update.message.reply_text("🔄 *جاري التحقق من التوكن...*", parse_mode="Markdown")
-    sess = make_session()
-    is_ok, fb, nick = await asyncio.get_event_loop().run_in_executor(
-        None, check_jwt_token, token
-    )
-    sess.close()
+    try:
+        is_ok, fb, nick = await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(None, check_jwt_token, token),
+            timeout=15
+        )
+    except asyncio.TimeoutError:
+        await msg.edit_text("❌ *انتهت مهلة الاتصال.*\n\nأرسل التوكن مرة أخرى.", parse_mode="Markdown")
+        return AWAITING_TOKEN
+    except Exception:
+        await msg.edit_text("❌ *خطأ في الاتصال.*\n\nأرسل التوكن مرة أخرى.", parse_mode="Markdown")
+        return AWAITING_TOKEN
 
     if not is_ok:
         await msg.edit_text(f"{fb}\n\nأرسل توكناً صحيحاً.", parse_mode="Markdown")
@@ -824,6 +847,7 @@ async def handle_target_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── حساب التمويل ────────────────────────────────────────────────
 
+@only_allowed
 async def handle_fund_calc_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.user_data.get("awaiting_fund_user"): return
     uid = update.effective_user.id
@@ -834,6 +858,7 @@ async def handle_fund_calc_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["awaiting_fund_amount"] = True
     await update.message.reply_text(f"✅ الهدف: @{res}\n\n💰 *كم متابع تريد إضافة؟*\nأرسل الرقم:", parse_mode="Markdown")
 
+@only_allowed
 async def handle_fund_calc_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.user_data.get("awaiting_fund_amount"): return
     uid    = update.effective_user.id
@@ -918,12 +943,13 @@ async def admin_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif action == "adm_stats":
         s  = db_get_stats()
         tp = s["top_user"]
+        top_line = f"`{tp[0]}` (`{tp[1]:,}` نقطة)" if tp else "لا يوجد"
         await query.edit_message_text(
             f"📊 *إحصائيات البوت:*\n\n"
             f"• إجمالي المستخدمين:  `{s['total_users']}`\n"
             f"• الجلسات النشطة:      `{s['active_users']}`\n"
             f"• مجموع النقاط:        `{s['total_points']:,}`\n"
-            f"• الأول:               `{tp[0]}` (`{tp[1]:,}` نقطة)" + ("\n" if tp else "") +
+            f"• الأول:               {top_line}\n"
             f"• إجمالي العمليات:     `{s['total_actions']}`",
             parse_mode="Markdown", reply_markup=get_admin_keyboard()
         )
@@ -1057,15 +1083,22 @@ async def general_text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── مستخدم: تغيير الحساب (توكن جديد) ──────────────────────────
     if ctx.user_data.get("awaiting_new_token"):
-        import asyncio
         token = text
         if len(token) < 20 or not token.startswith("ey"):
             await update.message.reply_text("❌ صيغة خاطئة — التوكن يبدأ بـ `ey`.\nأرسله مجدداً.", parse_mode="Markdown")
             return
         msg  = await update.message.reply_text("🔄 *جاري التحقق...*", parse_mode="Markdown")
-        sess = make_session()
-        is_ok, fb, nick = await asyncio.get_event_loop().run_in_executor(None, check_jwt_token, token)
-        sess.close()
+        try:
+            is_ok, fb, nick = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(None, check_jwt_token, token),
+                timeout=15
+            )
+        except asyncio.TimeoutError:
+            await msg.edit_text("❌ *انتهت مهلة الاتصال.*\n\nأرسل التوكن مرة أخرى.", parse_mode="Markdown")
+            return
+        except Exception:
+            await msg.edit_text("❌ *خطأ في الاتصال.*\n\nأرسل التوكن مرة أخرى.", parse_mode="Markdown")
+            return
         if not is_ok:
             await msg.edit_text(f"{fb}\n\nأرسل التوكن الجديد:", parse_mode="Markdown")
             return
