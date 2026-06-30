@@ -504,39 +504,47 @@ def refresh_token(uid: int) -> bool:
     return False
 
 def check_jwt_token(token: str) -> tuple[bool, str, str]:
-    """التحقق من التوكن عبر FetchOrders — نفس منطق TikSpark.py"""
+    """التحقق من التوكن — نسخة حرفية من TikSpark.py"""
     try:
-        sess = make_session()
-        r = sess.post(
+        payload = {
+            "operationName": "FetchOrders",
+            "variables": {"page": 2},
+            "query": "query FetchOrders($page: Int!) { getOrders(page: $page) { _id type videoLink tiktokerUsername avatar score priority } }"
+        }
+        headers = {
+            'User-Agent': "okhttp/4.12.0",
+            'Accept': "multipart/mixed; deferSpec=20220824, application/json",
+            'Accept-Encoding': "gzip",
+            'Content-Type': "application/json",
+            'x-apollo-operation-id': "c2ca4b87e63f30f2cca10e5867d17ea0f1712e96e716a60513f68758b2256185",
+            'x-apollo-operation-name': "FetchOrders",
+            'x-language': "ar",
+            'x-app-name': "com.dev.vidspark",
+            'token': token,
+            'x-csrf-token': "1782443248827:bf0ad4b105a1f6bcfca393d2f36fbe0f9cf690d37ba398113266884c14017d39",
+            'x-device-info': "{\"d\":\"30666439303936303830366134393632\",\"n\":\"5869616f6d69203233313144524b343847\",\"o\":\"16\",\"t\":\"d\",\"v\":\"2.2.0\",\"s\":\"0,0\"}",
+            'x-app-sig': "2998306f19b3a98732a7150a785204d487ae22cb530a0bf4b1ff77a380ad7cd4",
+            'x-app-ts': "1782443248827",
+            'x-app-nonce': "18b79765e8e0458c"
+        }
+        r = requests.post(
             API_URL,
-            json={
-                "operationName": "FetchOrders",
-                "variables": {"page": 2},
-                "query": "query FetchOrders($page: Int!) { getOrders(page: $page) { _id score } }"
-            },
-            headers=fetch_headers(token),
+            data=json.dumps(payload),
+            headers=headers,
             timeout=10
         )
-        sess.close()
-
         if r.status_code == 401:
             return False, "❌ التوكن منتهي الصلاحية أو غير صحيح.", ""
         if r.status_code != 200:
             return False, f"❌ خطأ من الخادم: {r.status_code}", ""
-
         data = r.json()
         if "errors" in data:
-            msg = data["errors"][0].get("message", "خطأ غير معروف")
-            return False, f"❌ {msg}", ""
-
+            return False, f"❌ {data['errors'][0].get('message','خطأ')}", ""
         orders = data.get("data", {}).get("getOrders", [])
-        # لو رجعت قائمة (حتى لو فاضية) يبقى التوكن شغال
         if orders is None:
             return False, "❌ استجابة غير متوقعة.", ""
-
         score = orders[0].get("score", 0) if orders else 0
-        return True, f"✅ تم تسجيل الدخول!\n🏆 النقاط الحالية: `{score:,}`", ""
-
+        return True, f"✅ تم تسجيل الدخول!\n🏆 النقاط: `{score:,}`", ""
     except requests.Timeout:
         return False, "⏱️ انتهت مهلة الاتصال.", ""
     except Exception as e:
