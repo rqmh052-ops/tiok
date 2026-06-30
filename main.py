@@ -1,10 +1,14 @@
+import os
+import re
 import time
-import json
 import logging
+import hashlib
+import hmac
 import threading
 import sqlite3
 import random
 from datetime import datetime
+from functools import wraps
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -16,21 +20,50 @@ from telegram.ext import (
 )
 
 # ===================================================================
-# 1. الإعدادات الأساسية والثوابت
+# 1. الإعدادات الأساسية
 # ===================================================================
 
-BOT_TOKEN        = "8130994366:AAEP5qKlVFRhFqQYPVtgX58NtEjORB-SbKA"
-API_URL          = "https://api.tikspark.xyz/graphql"
-MAX_POINTS       = 2000
-DB_PATH          = "bot_data.db"
+# 🔒 قراءة التوكن من متغير البيئة — لا تضعه أبداً في الكود مباشرة
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "❌ BOT_TOKEN غير موجود!\n"
+        "شغّل: export BOT_TOKEN='توكن_البوت_هنا'"
+    )
 
-# مراحل المحادثة (ConversationHandler)
+API_URL    = "https://api.tikspark.xyz/graphql"
+MAX_POINTS = 2000
+DB_PATH    = "bot_data.db"
+
+# 🔒 القائمة البيضاء — ضع user_id الخاص بك فقط
+# احصل على user_id بإرسال رسالة لـ @userinfobot
+ALLOWED_USER_IDS: set[int] = {
+    # مثال: 123456789
+    # أضف الـ user_ids المسموح لهم هنا
+}
+
+# 🔒 مفتاح تشفير البيانات الحساسة
+# أنشئه مرة واحدة بـ: python -c "import secrets; print(secrets.token_hex(32))"
+# ثم ضعه في: export CIPHER_KEY='المفتاح_هنا'
+CIPHER_KEY = os.environ.get("CIPHER_KEY", "")
+if not CIPHER_KEY:
+    raise RuntimeError(
+        "❌ CIPHER_KEY غير موجود!\n"
+        "شغّل: python -c \"import secrets; print(secrets.token_hex(32))\"\n"
+        "ثم: export CIPHER_KEY='الناتج_هنا'"
+    )
+
+# مراحل المحادثة
 AWAITING_USERNAME = 1
 AWAITING_PASSWORD = 2
-AWAITING_TARGET   = 3   # لإدخال اسم المستخدم المستهدف للرشق
+AWAITING_TARGET   = 3
+
+# Rate limiting
+RATE_LIMIT_WINDOW  = 60   # ثانية
+RATE_LIMIT_MAX_MSG = 30   # رسالة كحد أقصى في النافذة
 
 # ===================================================================
-# 2. إعدادات التسجيل (Logging)
+# 2. إعدادات التسجيل
 # ===================================================================
 
 logging.basicConfig(
@@ -44,53 +77,185 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ===================================================================
-# 3. قاعدة البيانات (SQLite) — حفظ كل شيء
+# 3. تشفير البيانات الحساسة (كلمة المرور والتوكن)
+# ===================================================================
+
+def _encrypt(plaintext: str) -> str:
+    """تشفير النص باستخدام XOR + HMAC للتحقق من السلامة."""
+    if not plaintext:
+        return ""
+    key_bytes  = bytes.fromhex(CIPHER_KEY)
+    text_bytes = plaintext.encode("utf-8")
+    encrypted  = bytes(b ^ key_bytes[i % len(key_bytes)] for i, b in enumerate(text_bytes))
+    mac        = hmac.new(key_bytes, encrypted, hashlib.sha256).hexdigest()
+    return mac + ":" + encrypted.hex()
+
+def _decrypt(ciphertext: str) -> str:
+    """فك تشفير النص مع التحقق من HMAC."""
+    if not ciphertext or ":" not in ciphertext:
+        return ""
+    try:
+        key_bytes         = bytes.fromhex(CIPHER_KEY)
+        mac_stored, enc_hex = ciphertext.split(":", 1)
+        encrypted         = bytes.fromhex(enc_hex)
+        mac_calc          = hmac.new(key_bytes, encrypted, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(mac_stored, mac_calc):
+            log.warning("⚠️ فشل التحقق من HMAC — بيانات تالفة محتملة")
+            return ""
+        decrypted = bytes(b ^ key_bytes[i % len(key_bytes)] for i, b in enumerate(encrypted))
+        return decrypted.decode("utf-8")
+    except Exception:
+        return ""
+
+# ===================================================================
+# 4. Rate Limiting
+# ===================================================================
+
+_rate_limit: dict[int, list[float]] = {}
+_rate_lock  = threading.Lock()
+
+def is_rate_limited(user_id: int) -> bool:
+    now = time.monotonic()
+    with _rate_lock:
+        times = [t for t in _rate_limit.get(user_id, []) if now - t < RATE_LIMIT_WINDOW]
+        if len(times) >= RATE_LIMIT_MAX_MSG:
+            _rate_limit[user_id] = times
+            return True
+        times.append(now)
+        _rate_limit[user_id] = times
+        return False
+
+def _cleanup_rate_limits():
+    while True:
+        time.sleep(300)
+        now = time.monotonic()
+        with _rate_lock:
+            for uid in list(_rate_limit.keys()):
+                _rate_limit[uid] = [t for t in _rate_limit[uid] if now - t < RATE_LIMIT_WINDOW]
+                if not _rate_limit[uid]:
+                    del _rate_limit[uid]
+
+threading.Thread(target=_cleanup_rate_limits, daemon=True, name="rate-cleaner").start()
+
+# ===================================================================
+# 5. Decorator: القائمة البيضاء + Rate Limiting
+# ===================================================================
+
+def only_allowed(func):
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = update.effective_user.id if update.effective_user else None
+        if not user_id:
+            return
+        # القائمة البيضاء — إذا كانت فارغة يعني لم تُعيَّن بعد
+        if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+            log.warning(f"🚫 وصول مرفوض: {user_id}")
+            if update.message:
+                await update.message.reply_text("⛔ غير مصرح لك باستخدام هذا البوت.")
+            elif update.callback_query:
+                await update.callback_query.answer("⛔ غير مصرح.", show_alert=True)
+            return
+        if is_rate_limited(user_id):
+            log.warning(f"⏱️ rate limit: {user_id}")
+            if update.message:
+                await update.message.reply_text("⏱️ أرسلت طلبات كثيرة. انتظر لحظة.")
+            elif update.callback_query:
+                await update.callback_query.answer("⏱️ انتظر قبل الضغط مجدداً.", show_alert=True)
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+# ===================================================================
+# 6. التحقق من المدخلات
+# ===================================================================
+
+def _sanitize_username(username: str) -> str:
+    """إزالة المحارف الخطيرة من اسم المستخدم."""
+    clean = re.sub(r"[^\w.]", "", username.strip().lstrip("@"))
+    return clean[:50]
+
+def _validate_username(raw: str) -> tuple[bool, str]:
+    cleaned = _sanitize_username(raw)
+    if len(cleaned) < 2:
+        return False, "❌ اسم المستخدم قصير جداً."
+    if len(cleaned) > 50:
+        return False, "❌ اسم المستخدم طويل جداً."
+    return True, cleaned
+
+def _validate_password(password: str) -> tuple[bool, str]:
+    if len(password) < 4:
+        return False, "❌ كلمة المرور قصيرة جداً."
+    if len(password) > 128:
+        return False, "❌ كلمة المرور طويلة جداً."
+    return True, password
+
+def _validate_order_id(oid: str) -> bool:
+    """التحقق من أن order_id هو MongoDB ObjectId صالح."""
+    return bool(re.match(r'^[a-f0-9]{24}$', str(oid)))
+
+# ===================================================================
+# 7. قاعدة البيانات
 # ===================================================================
 
 def init_db():
-    """إنشاء جدول المستخدمين إذا لم يكن موجوداً."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT NOT NULL,
-            password TEXT NOT NULL,
-            token TEXT,
-            total_points INTEGER DEFAULT 0,
-            speed REAL DEFAULT 0.2,
-            is_paused INTEGER DEFAULT 0,
-            last_score INTEGER DEFAULT 0,
-            start_time TEXT,
+            user_id       INTEGER PRIMARY KEY,
+            username      TEXT NOT NULL,
+            password_enc  TEXT NOT NULL,
+            token_enc     TEXT,
+            total_points  INTEGER DEFAULT 0,
+            speed         REAL    DEFAULT 0.2,
+            is_paused     INTEGER DEFAULT 0,
+            last_score    INTEGER DEFAULT 0,
+            start_time    TEXT,
             session_active INTEGER DEFAULT 0,
             target_username TEXT,
-            order_id TEXT,
-            rush_enabled INTEGER DEFAULT 0
+            order_id      TEXT,
+            rush_enabled  INTEGER DEFAULT 0,
+            created_at    TEXT DEFAULT (datetime('now')),
+            last_seen     TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            action  TEXT,
+            detail  TEXT,
+            ts      TEXT DEFAULT (datetime('now'))
         )
     """)
     conn.commit()
     conn.close()
 
-def db_get_user(user_id: int):
-    """استرجاع بيانات مستخدم من قاعدة البيانات."""
+def _audit(conn: sqlite3.Connection, user_id: int, action: str, detail: str = ""):
+    conn.execute(
+        "INSERT INTO audit_log (user_id, action, detail) VALUES (?, ?, ?)",
+        (user_id, action, detail[:200])
+    )
+
+def db_get_user(user_id: int) -> dict | None:
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
+    cur  = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    row  = cur.fetchone()
     conn.close()
     if row:
         return {
-            "user_id": row[0],
-            "username": row[1],
-            "password": row[2],
-            "token": row[3],
-            "total_points": row[4],
-            "speed": row[5],
-            "is_paused": row[6],
-            "last_score": row[7],
-            "start_time": row[8],
-            "session_active": row[9],
+            "user_id":         row[0],
+            "username":        row[1],
+            "password":        _decrypt(row[2]),
+            "token":           _decrypt(row[3]) if row[3] else "",
+            "total_points":    row[4],
+            "speed":           row[5],
+            "is_paused":       row[6],
+            "last_score":      row[7],
+            "start_time":      row[8],
+            "session_active":  row[9],
             "target_username": row[10],
-            "order_id": row[11],
-            "rush_enabled": row[12]
+            "order_id":        row[11],
+            "rush_enabled":    row[12],
         }
     return None
 
@@ -98,39 +263,53 @@ def db_save_user(user_id: int, username: str, password: str, token: str = None,
                  total_points: int = 0, speed: float = 0.2, is_paused: int = 0,
                  last_score: int = 0, start_time: str = None, session_active: int = 0,
                  target_username: str = None, order_id: str = None, rush_enabled: int = 0):
-    """حفظ أو تحديث بيانات مستخدم في قاعدة البيانات."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         INSERT OR REPLACE INTO users
-        (user_id, username, password, token, total_points, speed, is_paused,
-         last_score, start_time, session_active, target_username, order_id, rush_enabled)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (user_id, username, password, token, total_points, speed, is_paused,
-          last_score, start_time, session_active, target_username, order_id, rush_enabled))
+        (user_id, username, password_enc, token_enc, total_points, speed, is_paused,
+         last_score, start_time, session_active, target_username, order_id, rush_enabled, last_seen)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    """, (
+        user_id, username,
+        _encrypt(password),
+        _encrypt(token) if token else None,
+        total_points, speed, is_paused,
+        last_score, start_time, session_active,
+        target_username, order_id, rush_enabled
+    ))
+    _audit(conn, user_id, "save_user", f"username={username}")
     conn.commit()
     conn.close()
 
 def db_update_points(user_id: int, total_points: int, last_score: int, session_active: int = 1):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE users SET total_points=?, last_score=?, session_active=? WHERE user_id=?",
-                 (total_points, last_score, session_active, user_id))
+    conn.execute(
+        "UPDATE users SET total_points=?, last_score=?, session_active=?, last_seen=datetime('now') WHERE user_id=?",
+        (total_points, last_score, session_active, user_id)
+    )
     conn.commit()
     conn.close()
 
 def db_update_token(user_id: int, token: str):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE users SET token=? WHERE user_id=?", (token, user_id))
+    conn.execute(
+        "UPDATE users SET token_enc=?, last_seen=datetime('now') WHERE user_id=?",
+        (_encrypt(token), user_id)
+    )
+    _audit(conn, user_id, "token_refresh", "")
     conn.commit()
     conn.close()
 
 def db_update_speed(user_id: int, speed: float):
-    conn = sqlite3.connect(DB_PATH)
+    speed = max(0.005, min(speed, 5.0))
+    conn  = sqlite3.connect(DB_PATH)
     conn.execute("UPDATE users SET speed=? WHERE user_id=?", (speed, user_id))
     conn.commit()
     conn.close()
 
 def db_update_pause(user_id: int, is_paused: int):
-    conn = sqlite3.connect(DB_PATH)
+    is_paused = 1 if is_paused else 0
+    conn      = sqlite3.connect(DB_PATH)
     conn.execute("UPDATE users SET is_paused=? WHERE user_id=?", (is_paused, user_id))
     conn.commit()
     conn.close()
@@ -138,26 +317,32 @@ def db_update_pause(user_id: int, is_paused: int):
 def db_update_rush(user_id: int, rush_enabled: int, target_username: str = None, order_id: str = None):
     conn = sqlite3.connect(DB_PATH)
     if target_username is not None:
-        conn.execute("UPDATE users SET rush_enabled=?, target_username=?, order_id=? WHERE user_id=?",
-                     (rush_enabled, target_username, order_id, user_id))
+        target_username = _sanitize_username(target_username)
+        conn.execute(
+            "UPDATE users SET rush_enabled=?, target_username=?, order_id=? WHERE user_id=?",
+            (rush_enabled, target_username, order_id, user_id)
+        )
     else:
         conn.execute("UPDATE users SET rush_enabled=? WHERE user_id=?", (rush_enabled, user_id))
     conn.commit()
     conn.close()
 
 def db_reset_user(user_id: int):
-    """إعادة تعيين نقاط المستخدم وجلساته."""
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE users SET total_points=0, last_score=0, session_active=0, start_time=NULL, rush_enabled=0 WHERE user_id=?", (user_id,))
+    conn.execute(
+        "UPDATE users SET total_points=0, last_score=0, session_active=0, start_time=NULL, rush_enabled=0 WHERE user_id=?",
+        (user_id,)
+    )
+    _audit(conn, user_id, "reset", "")
     conn.commit()
     conn.close()
 
 # ===================================================================
-# 4. جلسة HTTP مع إعادة المحاولة
+# 8. جلسة HTTP
 # ===================================================================
 
 def make_session() -> requests.Session:
-    s = requests.Session()
+    s     = requests.Session()
     retry = Retry(total=3, backoff_factor=1.5,
                   status_forcelist=[429, 500, 502, 503, 504],
                   allowed_methods=["POST", "GET"])
@@ -167,7 +352,7 @@ def make_session() -> requests.Session:
     return s
 
 # ===================================================================
-# 5. الهيدرز (مأخوذة من ملف الرشق المرفق، محدثة بدقة)
+# 9. الهيدرز
 # ===================================================================
 
 def login_headers() -> dict:
@@ -291,30 +476,29 @@ def action_headers(token: str) -> dict:
     }
 
 # ===================================================================
-# 6. دوال تسجيل الدخول والتحقق
+# 10. دوال API (تسجيل الدخول والرشق)
 # ===================================================================
 
 def check_account(username: str, sess: requests.Session) -> tuple[bool, str]:
-    """التحقق من وجود الحساب في TikSpark."""
     try:
         payload = {
             "operationName": "CheckAccount",
             "variables": {"username": username},
             "query": "query CheckAccount($username: String!) { checkAccount(username: $username) { isExist code } }"
         }
-        resp = sess.post(API_URL, json=payload, headers=check_account_headers(), timeout=10)
+        resp  = sess.post(API_URL, json=payload, headers=check_account_headers(), timeout=10)
         if resp.status_code != 200:
             return False, f"❌ خطأ من الخادم: {resp.status_code}"
-        data = resp.json()
+        data  = resp.json()
         check = data.get("data", {}).get("checkAccount", {})
         if check.get("isExist"):
             return True, "✅ الحساب موجود"
         return False, "❌ الحساب غير موجود في TikSpark"
     except Exception as e:
-        return False, f"⚠️ خطأ: {e}"
+        log.warning(f"check_account error: {type(e).__name__}")
+        return False, "⚠️ خطأ في الاتصال"
 
 def get_tiktok_profile(username: str, sess: requests.Session) -> dict:
-    """جلب بيانات البروفايل من TikSpark (RequestProfileBundleByUsername)."""
     try:
         payload = {
             "operationName": "RequestProfileBundleByUsername",
@@ -322,22 +506,19 @@ def get_tiktok_profile(username: str, sess: requests.Session) -> dict:
                 "username": username,
                 "signature": "9653c96a87a1296606dbf2826f40a958af5fe0ae801b5dc472d135c6bdea6d7e",
                 "timestamp": "1782747309973",
-                "nonce": "20fa2c4d17024dce"
+                "nonce":     "20fa2c4d17024dce"
             },
             "query": "mutation RequestProfileBundleByUsername($username: String!, $signature: String!, $timestamp: String!, $nonce: String!) { requestProfileBundleByUsername(username: $username, signature: $signature, timestamp: $timestamp, nonce: $nonce) { profile { method url headers body } } }"
         }
         resp = sess.post(API_URL, json=payload, headers=profile_headers(), timeout=12)
         if resp.status_code != 200:
             return {}
-        data = resp.json()
-        profile_bundle = data.get("data", {}).get("requestProfileBundleByUsername", {}).get("profile", {})
-        return profile_bundle
+        return resp.json().get("data", {}).get("requestProfileBundleByUsername", {}).get("profile", {})
     except Exception as e:
-        log.warning(f"get_tiktok_profile error: {e}")
+        log.warning(f"get_tiktok_profile error: {type(e).__name__}")
         return {}
 
 def fetch_tiktok_user_info(profile_bundle: dict, sess: requests.Session) -> dict:
-    """استخدام bundle لجلب بيانات المستخدم من TikTok API."""
     try:
         if not profile_bundle:
             return {}
@@ -346,26 +527,34 @@ def fetch_tiktok_user_info(profile_bundle: dict, sess: requests.Session) -> dict
         headers = profile_bundle.get("headers", {})
         body    = profile_bundle.get("body", "")
 
-        if not url:
+        # 🔒 منع SSRF — السماح فقط بنطاقات TikTok
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        if not url or parsed.scheme not in ("http", "https"):
+            log.warning(f"⚠️ URL غير صالح في profile_bundle")
+            return {}
+        allowed_domains = ("tiktok.com", "tiktokv.com", "bytedance.com", "ibyteimg.com")
+        if not any(parsed.netloc.endswith(d) for d in allowed_domains):
+            log.warning(f"⚠️ نطاق غير مسموح به: {parsed.netloc}")
             return {}
 
-        if method == "GET":
-            resp = sess.get(url, headers=headers, timeout=12)
-        else:
-            resp = sess.post(url, data=body, headers=headers, timeout=12)
+        resp = sess.get(url, headers=headers, timeout=12) if method == "GET" \
+               else sess.post(url, data=body, headers=headers, timeout=12)
 
         if resp.status_code != 200:
             return {}
 
         tiktok_data = resp.json()
-        user = tiktok_data.get("user", {}) or tiktok_data.get("userInfo", {}).get("user", {})
+        user  = tiktok_data.get("user", {}) or tiktok_data.get("userInfo", {}).get("user", {})
         stats = tiktok_data.get("stats", {}) or tiktok_data.get("userInfo", {}).get("stats", {})
 
         return {
             "id":             str(user.get("id", "")),
             "uniqueId":       user.get("uniqueId", ""),
             "nickname":       user.get("nickname", ""),
-            "avatarMedium":   user.get("avatarMedium", {}).get("urlList", [""])[0] if isinstance(user.get("avatarMedium"), dict) else user.get("avatarMedium", ""),
+            "avatarMedium":   user.get("avatarMedium", {}).get("urlList", [""])[0]
+                              if isinstance(user.get("avatarMedium"), dict)
+                              else user.get("avatarMedium", ""),
             "followerCount":  stats.get("followerCount", 0),
             "followingCount": stats.get("followingCount", 0),
             "videoCount":     stats.get("videoCount", 0),
@@ -373,24 +562,16 @@ def fetch_tiktok_user_info(profile_bundle: dict, sess: requests.Session) -> dict
             "privateAccount": user.get("privateAccount", False),
         }
     except Exception as e:
-        log.warning(f"fetch_tiktok_user_info error: {e}")
+        log.warning(f"fetch_tiktok_user_info error: {type(e).__name__}")
         return {}
 
 def do_login(username: str, password: str, sess: requests.Session) -> tuple[bool, str, str]:
-    """
-    تسجيل الدخول الكامل:
-    1. تحقق من الحساب في TikSpark.
-    2. جلب بروفايل TikTok (اختياري).
-    3. تنفيذ LoginAccount للحصول على accessToken.
-    """
-    # خطوة 1
     exists, msg = check_account(username, sess)
     if not exists:
         return False, msg, ""
 
-    # خطوة 2
-    profile_bundle  = get_tiktok_profile(username, sess)
-    tiktok_info     = fetch_tiktok_user_info(profile_bundle, sess) if profile_bundle else {}
+    profile_bundle = get_tiktok_profile(username, sess)
+    tiktok_info    = fetch_tiktok_user_info(profile_bundle, sess) if profile_bundle else {}
 
     user_data = {
         "id":             tiktok_info.get("id", ""),
@@ -406,13 +587,11 @@ def do_login(username: str, password: str, sess: requests.Session) -> tuple[bool
         "password":       password,
     }
 
-    # خطوة 3
     try:
         LOGIN_Q = """
         mutation LoginAccount($data: TiktokInfo) {
             loginTiktok(data: $data) {
-                accessToken
-                refreshToken
+                accessToken refreshToken
                 user { __typename ...UserFields }
             }
         }
@@ -423,12 +602,8 @@ def do_login(username: str, password: str, sess: requests.Session) -> tuple[bool
             isSubscription allowd referralCode referralCount referredBy
         }
         """
-        payload = {
-            "operationName": "LoginAccount",
-            "variables":     {"data": user_data},
-            "query":         LOGIN_Q,
-        }
-        resp = sess.post(API_URL, json=payload, headers=login_headers(), timeout=12)
+        payload = {"operationName": "LoginAccount", "variables": {"data": user_data}, "query": LOGIN_Q}
+        resp    = sess.post(API_URL, json=payload, headers=login_headers(), timeout=12)
 
         if resp.status_code != 200:
             return False, f"❌ خطأ من الخادم: {resp.status_code}", ""
@@ -451,57 +626,53 @@ def do_login(username: str, password: str, sess: requests.Session) -> tuple[bool
         nickname  = user_info.get("nickname") or user_info.get("username") or username
         score     = user_info.get("score", 0)
 
+        log.info(f"✅ تسجيل دخول ناجح: {username}")
         return True, f"✅ تم تسجيل الدخول!\n👤 {nickname}\n🏆 النقاط الحالية: `{score:,}`", access_token
 
     except requests.Timeout:
         return False, "⏱️ انتهت مهلة الاتصال — حاول مرة أخرى.", ""
     except Exception as e:
-        return False, f"⚠️ خطأ: {e}", ""
+        log.warning(f"do_login error: {type(e).__name__}")
+        return False, "⚠️ خطأ في الاتصال.", ""
 
 def refresh_token(user_id: int) -> bool:
-    """
-    إعادة تسجيل الدخول تلقائياً باستخدام بيانات المستخدم المحفوظة في قاعدة البيانات.
-    تُستخدم عند انتهاء صلاحية التوكن (كود 401).
-    """
     user = db_get_user(user_id)
     if not user or not user["username"] or not user["password"]:
         return False
-    sess = make_session()
-    success, msg, token = do_login(user["username"], user["password"], sess)
+    sess    = make_session()
+    success, _, token = do_login(user["username"], user["password"], sess)
     sess.close()
     if success and token:
         db_update_token(user_id, token)
-        log.info(f"✅ تم تجديد التوكن للمستخدم {user_id}")
         return True
-    log.warning(f"❌ فشل تجديد التوكن للمستخدم {user_id}: {msg}")
     return False
 
-# ===================================================================
-# 7. دوال الرشق (CreateOrder + SwitchOrder)
-# ===================================================================
-
 def create_order(token: str, target_username: str, amount: int = 20, initial_count: int = 34) -> tuple[bool, str, str]:
-    """إنشاء طلب (متابعين) على حساب مستهدف."""
     try:
-        sess = make_session()
-        # جلب صورة المستخدم المستهدف (avatar) حتى ينجح الطلب
-        profile = get_tiktok_profile(target_username, sess)
+        target_username = _sanitize_username(target_username)
+        if len(target_username) < 2:
+            return False, "اسم المستخدم غير صالح", ""
+
+        amount        = max(1, min(amount, 1000))
+        initial_count = max(0, min(initial_count, 10000))
+
+        sess        = make_session()
+        profile     = get_tiktok_profile(target_username, sess)
         tiktok_info = fetch_tiktok_user_info(profile, sess) if profile else {}
-        avatar = tiktok_info.get("avatarMedium", "")
+        avatar      = tiktok_info.get("avatarMedium", "")
 
         payload = {
             "operationName": "CreateOrder",
             "variables": {
-                "type": "followers",
-                "amount": amount,
+                "type": "followers", "amount": amount,
                 "tiktokerUsername": target_username,
-                "avatar": avatar,
-                "initialCount": initial_count
+                "avatar": avatar, "initialCount": initial_count
             },
             "query": "mutation CreateOrder($type: Action!, $amount: Int!, $tiktokerUsername: String, $videoLink: String, $avatar: String, $initialCount: Int) { createOrder(orderInput: { type: $type amount: $amount tiktokerUsername: $tiktokerUsername videoLink: $videoLink avatar: $avatar initialCount: $initialCount } ) { _id type videoLink tiktokerUsername avatar score priority amount initialCount fulfilled isPublished status createdAt } }"
         }
         resp = sess.post(API_URL, json=payload, headers=create_order_headers(token), timeout=12)
         sess.close()
+
         if resp.status_code != 200:
             return False, f"فشل إنشاء الطلب (كود {resp.status_code})", ""
         data = resp.json()
@@ -512,11 +683,13 @@ def create_order(token: str, target_username: str, amount: int = 20, initial_cou
             return True, f"✅ تم إنشاء طلب الرشق على @{target_username}", order_id
         return False, "❌ لم يتم استلام Order ID", ""
     except Exception as e:
-        return False, f"⚠️ خطأ: {e}", ""
+        log.warning(f"create_order error: {type(e).__name__}")
+        return False, "⚠️ خطأ في إنشاء الطلب", ""
 
 def switch_order(token: str, order_id: str) -> tuple[bool, str]:
-    """تبديل حالة الطلب (تشغيل/إيقاف) لكسب نقاط إضافية."""
     try:
+        if not _validate_order_id(order_id):
+            return False, "Order ID غير صالح"
         payload = {
             "operationName": "SwitchOrder",
             "variables": {"orderId": order_id},
@@ -533,62 +706,54 @@ def switch_order(token: str, order_id: str) -> tuple[bool, str]:
         status = data.get("data", {}).get("switchOrder", {}).get("status", "unknown")
         return True, f"✅ تم تبديل حالة الطلب إلى: {status}"
     except Exception as e:
-        return False, f"⚠️ خطأ: {e}"
+        log.warning(f"switch_order error: {type(e).__name__}")
+        return False, "⚠️ خطأ في تبديل الطلب"
 
 # ===================================================================
-# 8. دالة جمع النقاط الأساسية + نظام الرشق (تعمل في خيط منفصل)
+# 11. تتبع الخيوط النشطة ودالة جمع النقاط
 # ===================================================================
+
+_active_threads: dict[int, threading.Thread] = {}
+_threads_lock   = threading.Lock()
 
 def collect_points(user_id: int, bot):
-    """
-    الحلقة الرئيسية لجمع النقاط:
-    - FetchOrders → ActionOrder
-    - كل 5 دورات: CreateOrder / SwitchOrder (إذا كان الرشق مفعّلاً)
-    - تجديد التوكن تلقائياً عند انتهاء الصلاحية
-    - الحد الأقصى 2000 نقطة
-    """
     user = db_get_user(user_id)
     if not user or not user["token"]:
-        log.warning(f"لا يوجد توكن للمستخدم {user_id}")
         return
 
-    token = user["token"]
-    target_username = user.get("target_username")
-    rush_enabled = user.get("rush_enabled", 0)
-    order_id = user.get("order_id")
+    with _threads_lock:
+        _active_threads[user_id] = threading.current_thread()
 
-    # حالة الجلسة (تُحفظ في الذاكرة المحلية)
+    token           = user["token"]
+    target_username = user.get("target_username")
+    rush_enabled    = user.get("rush_enabled", 0)
+
     st = {
-        "running": True,
-        "paused": False,
-        "total_score": user["total_points"],
-        "last_score": user["last_score"],
-        "start_time": datetime.now(),
-        "session_active": True,
+        "running":      True,
+        "total_score":  user["total_points"],
+        "last_score":   user["last_score"],
         "rush_counter": 0,
-        "order_id": order_id,
+        "order_id":     user.get("order_id"),
     }
 
     sess = make_session()
-    fh = fetch_headers(token)
-    ah = action_headers(token)
+    fh   = fetch_headers(token)
+    ah   = action_headers(token)
 
     def send(text: str, kbd=True):
         try:
             bot.send_message(
-                chat_id=user_id,
-                text=text,
-                parse_mode="Markdown",
+                chat_id=user_id, text=text, parse_mode="Markdown",
                 reply_markup=get_main_keyboard() if kbd else None
             )
         except Exception as ex:
-            log.warning(f"فشل إرسال رسالة للمستخدم {user_id}: {ex}")
+            log.warning(f"send error [{user_id}]: {type(ex).__name__}")
 
     send("🚀 *بدأ جمع النقاط!*\nالحد الأقصى: 2000 نقطة.")
     if rush_enabled and target_username:
         send(f"🔄 *وضع الرشق مفعّل* على @{target_username}")
 
-    FETCH_Q = "query FetchOrders($page: Int!) { getOrders(page: $page) { _id } }"
+    FETCH_Q  = "query FetchOrders($page: Int!) { getOrders(page: $page) { _id } }"
     ACTION_Q = """
     mutation ActionOrder($orderId: ID!, $validationData: ValidationDataInput!) {
         actionOrder(orderId: $orderId, validationData: $validationData) {
@@ -598,215 +763,195 @@ def collect_points(user_id: int, bot):
     }"""
 
     consecutive_errors = 0
-    MAX_CONSECUTIVE = 5
-    last_score = st["last_score"]
+    MAX_CONSECUTIVE    = 5
+    last_score         = st["last_score"]
 
-    while st["running"]:
-        # التحقق من الحد الأقصى
-        if st["total_score"] >= MAX_POINTS:
-            send(f"🏆 *وصلت للحد الأقصى!*\nالإجمالي: `{st['total_score']:,}` نقطة\nاستخدم /start للبدء من جديد.", kbd=False)
-            db_reset_user(user_id)
-            break
+    try:
+        while st["running"]:
+            if st["total_score"] >= MAX_POINTS:
+                send(f"🏆 *وصلت للحد الأقصى!*\nالإجمالي: `{st['total_score']:,}` نقطة.", kbd=False)
+                db_reset_user(user_id)
+                break
 
-        # التحقق من الإيقاف المؤقت (من قاعدة البيانات)
-        user_check = db_get_user(user_id)
-        if user_check and user_check["is_paused"] == 1:
-            st["paused"] = True
-            time.sleep(1)
-            continue
-        else:
-            st["paused"] = False
-
-        try:
-            # ── 1. جلب الطلبات ──────────────────────────────────────────
-            r1 = sess.post(
-                API_URL,
-                json={"operationName": "FetchOrders", "variables": {"page": 2}, "query": FETCH_Q},
-                headers=fh,
-                timeout=12
-            )
-            if r1.status_code == 401:
-                send("⛔ *انتهت صلاحية التوكن!*\nجاري تجديد الجلسة تلقائياً...", kbd=False)
-                if refresh_token(user_id):
-                    new_user = db_get_user(user_id)
-                    if new_user and new_user["token"]:
-                        token = new_user["token"]
-                        fh = fetch_headers(token)
-                        ah = action_headers(token)
-                        send("✅ *تم تجديد الجلسة!*", kbd=False)
-                        continue
-                    else:
-                        send("❌ *فشل تجديد الجلسة.*", kbd=False)
-                        break
-                else:
-                    send("❌ *فشل تجديد الجلسة.*\nيرجى تسجيل الدخول مجدداً بـ /start", kbd=False)
-                    break
-
-            if r1.status_code != 200:
-                raise ValueError(f"كود الخادم: {r1.status_code}")
-
-            orders = r1.json().get("data", {}).get("getOrders", [])
-            if not orders:
-                send("📭 *لا توجد طلبات متاحة الآن.*\nسيتم الانتظار 10 ثوانٍ...")
-                time.sleep(10)
+            user_check = db_get_user(user_id)
+            if user_check and user_check["is_paused"] == 1:
+                time.sleep(1)
                 continue
 
-            order_id_fetched = orders[0]["_id"]
+            try:
+                # ── FetchOrders ──────────────────────────────────────
+                r1 = sess.post(
+                    API_URL,
+                    json={"operationName": "FetchOrders", "variables": {"page": 2}, "query": FETCH_Q},
+                    headers=fh, timeout=12
+                )
+                if r1.status_code == 401:
+                    send("⛔ *انتهت صلاحية التوكن!*\nجاري تجديد الجلسة...", kbd=False)
+                    if refresh_token(user_id):
+                        new_user = db_get_user(user_id)
+                        if new_user and new_user["token"]:
+                            token = new_user["token"]
+                            fh    = fetch_headers(token)
+                            ah    = action_headers(token)
+                            send("✅ *تم تجديد الجلسة!*", kbd=False)
+                            continue
+                    send("❌ *فشل تجديد الجلسة.*\nيرجى /start", kbd=False)
+                    break
 
-            # ── 2. تنفيذ الطلب (ActionOrder) ──────────────────────────
-            r2 = sess.post(
-                API_URL,
-                json={
-                    "operationName": "ActionOrder",
-                    "variables": {
-                        "orderId": order_id_fetched,
-                        "validationData": {
-                            "attempts": 1,
-                            "initialNumber": random.uniform(1000, 5000),
-                            "timeSpent": random.randint(15000, 45000)
-                        }
+                if r1.status_code != 200:
+                    raise ValueError(f"كود الخادم: {r1.status_code}")
+
+                orders = r1.json().get("data", {}).get("getOrders", [])
+                if not orders:
+                    send("📭 *لا توجد طلبات متاحة.*\nانتظر 10 ثوانٍ...")
+                    time.sleep(10)
+                    continue
+
+                # 🔒 التحقق من صحة order_id
+                raw_oid = str(orders[0].get("_id", ""))
+                if not _validate_order_id(raw_oid):
+                    log.warning(f"⚠️ order_id غير صالح: {raw_oid[:30]}")
+                    time.sleep(2)
+                    continue
+
+                # ── ActionOrder ──────────────────────────────────────
+                r2 = sess.post(
+                    API_URL,
+                    json={
+                        "operationName": "ActionOrder",
+                        "variables": {
+                            "orderId": raw_oid,
+                            "validationData": {
+                                "attempts": 1,
+                                "initialNumber": random.uniform(1000, 5000),
+                                "timeSpent":     random.randint(15000, 45000)
+                            }
+                        },
+                        "query": ACTION_Q
                     },
-                    "query": ACTION_Q
-                },
-                headers=ah,
-                timeout=12
-            )
-            if r2.status_code == 401:
-                if refresh_token(user_id):
-                    new_user = db_get_user(user_id)
-                    if new_user and new_user["token"]:
-                        token = new_user["token"]
-                        fh = fetch_headers(token)
-                        ah = action_headers(token)
-                        continue
-                send("❌ *فشل تجديد الجلسة.*", kbd=False)
-                break
-
-            if r2.status_code != 200:
-                raise ValueError(f"فشل تنفيذ الطلب — كود: {r2.status_code}")
-
-            # ── 3. معالجة النتيجة ────────────────────────────────────────
-            result = r2.json()
-            api_err = result.get("errors")
-            if api_err:
-                raise ValueError(api_err[0].get("message", "خطأ API غير معروف"))
-
-            action = result.get("data", {}).get("actionOrder") or {}
-            score = action.get("score", last_score)
-            progress = action.get("taskProgress") or {}
-            count = progress.get("count", 0)
-
-            gained = max(0, score - last_score)
-            last_score = score
-            st["total_score"] = score
-            st["last_score"] = score
-            consecutive_errors = 0
-
-            # تحديث قاعدة البيانات
-            db_update_points(user_id, score, last_score, 1)
-
-            # ── 4. بناء رسالة النقاط ─────────────────────────────────
-            if count == 0 and gained > 3:
-                bonus = gained - 3
-                msg = (
-                    f"🎉 *اكتملت دورة!*\n"
-                    f"➕ مكافأة: `+{bonus}` نقطة\n"
-                    f"🏆 الإجمالي: `{score:,}` نقطة"
+                    headers=ah, timeout=12
                 )
-            else:
-                bar_fill = min(count, 10)
-                bar = "█" * bar_fill + "░" * (10 - bar_fill)
-                msg = (
-                    f"✅ *تم جمع `+{gained}` نقطة*\n"
-                    f"📈 `[{bar}]` {count}/∞\n"
-                    f"🏆 الإجمالي: `{score:,}` نقطة"
-                )
+                if r2.status_code == 401:
+                    if refresh_token(user_id):
+                        new_user = db_get_user(user_id)
+                        if new_user and new_user["token"]:
+                            token = new_user["token"]
+                            fh    = fetch_headers(token)
+                            ah    = action_headers(token)
+                            continue
+                    send("❌ *فشل تجديد الجلسة.*", kbd=False)
+                    break
 
-            send(msg)
+                if r2.status_code != 200:
+                    raise ValueError(f"فشل ActionOrder — كود: {r2.status_code}")
 
-            # ── 5. نظام الرشق (كل 5 دورات) ────────────────────────────
-            if rush_enabled and target_username:
-                st["rush_counter"] += 1
-                if st["rush_counter"] % 5 == 0:
-                    if not st["order_id"]:
-                        # إنشاء طلب جديد
-                        success, cr_msg, new_order_id = create_order(token, target_username, amount=20, initial_count=34)
-                        if success and new_order_id:
-                            st["order_id"] = new_order_id
-                            db_update_rush(user_id, 1, target_username, new_order_id)
-                            send(f"🔄 {cr_msg}\n🆔 `{new_order_id}`")
+                result  = r2.json()
+                api_err = result.get("errors")
+                if api_err:
+                    raise ValueError(api_err[0].get("message", "خطأ API"))
+
+                action   = result.get("data", {}).get("actionOrder") or {}
+                score    = action.get("score", last_score)
+                progress = action.get("taskProgress") or {}
+                count    = progress.get("count", 0)
+                gained   = max(0, score - last_score)
+
+                last_score         = score
+                st["total_score"]  = score
+                st["last_score"]   = score
+                consecutive_errors = 0
+
+                db_update_points(user_id, score, last_score, 1)
+
+                # ── رسالة التقدم ─────────────────────────────────────
+                if count == 0 and gained > 3:
+                    send(f"🎉 *اكتملت دورة!*\n➕ مكافأة: `+{gained - 3}` نقطة\n🏆 الإجمالي: `{score:,}` نقطة")
+                else:
+                    bar  = "█" * min(count, 10) + "░" * (10 - min(count, 10))
+                    send(f"✅ *تم جمع `+{gained}` نقطة*\n📈 `[{bar}]` {count}/∞\n🏆 الإجمالي: `{score:,}` نقطة")
+
+                # ── نظام الرشق ───────────────────────────────────────
+                if rush_enabled and target_username:
+                    st["rush_counter"] += 1
+                    if st["rush_counter"] % 5 == 0:
+                        if not st["order_id"]:
+                            ok, msg_r, new_oid = create_order(token, target_username)
+                            if ok and new_oid:
+                                st["order_id"] = new_oid
+                                db_update_rush(user_id, 1, target_username, new_oid)
+                                send(f"🔄 {msg_r}\n🆔 `{new_oid}`")
+                            else:
+                                send(f"⚠️ فشل إنشاء الطلب: {msg_r}")
                         else:
-                            send(f"⚠️ فشل إنشاء الطلب: {cr_msg}")
-                    else:
-                        # تبديل الطلب الحالي
-                        success, sw_msg = switch_order(token, st["order_id"])
-                        if success:
-                            send(f"🔄 {sw_msg}")
-                        else:
-                            send(f"⚠️ فشل تبديل الطلب: {sw_msg}\nسيتم إنشاء طلب جديد.")
-                            st["order_id"] = None
-                            db_update_rush(user_id, 1, target_username, None)
+                            ok, msg_s = switch_order(token, st["order_id"])
+                            if ok:
+                                send(f"🔄 {msg_s}")
+                            else:
+                                send(f"⚠️ {msg_s}\nسيتم إنشاء طلب جديد.")
+                                st["order_id"] = None
+                                db_update_rush(user_id, 1, target_username, None)
 
-            # ── 6. الانتظار حسب السرعة ────────────────────────────────
-            time.sleep(user_check["speed"] if user_check else 0.2)
+                time.sleep(user_check["speed"] if user_check else 0.2)
 
-        except ValueError as ve:
-            consecutive_errors += 1
-            log.warning(f"[{user_id}] خطأ: {ve}")
-            send(f"⚠️ *خطأ:* {ve}\nالمحاولة {consecutive_errors}/{MAX_CONSECUTIVE}...")
-            if consecutive_errors >= MAX_CONSECUTIVE:
-                send(f"🛑 *توقف تلقائي* — {MAX_CONSECUTIVE} أخطاء متتالية.\nيرجى إعادة التشغيل بـ /start", kbd=False)
-                break
-            time.sleep(3 * consecutive_errors)
+            except ValueError as ve:
+                consecutive_errors += 1
+                log.warning(f"[{user_id}] ValueError: {ve}")
+                send(f"⚠️ *خطأ:* {ve}\nالمحاولة {consecutive_errors}/{MAX_CONSECUTIVE}...")
+                if consecutive_errors >= MAX_CONSECUTIVE:
+                    send(f"🛑 *توقف تلقائي* — {MAX_CONSECUTIVE} أخطاء.\nيرجى /start", kbd=False)
+                    break
+                time.sleep(3 * consecutive_errors)
 
-        except requests.Timeout:
-            consecutive_errors += 1
-            send(f"⏱️ *انتهت مهلة الاتصال* — إعادة المحاولة... ({consecutive_errors})")
-            time.sleep(4)
+            except requests.Timeout:
+                consecutive_errors += 1
+                send(f"⏱️ *مهلة الاتصال* — إعادة المحاولة... ({consecutive_errors})")
+                time.sleep(4)
 
-        except Exception as e:
-            consecutive_errors += 1
-            log.exception(f"[{user_id}] خطأ غير متوقع")
-            send(f"🔴 *خطأ غير متوقع:*\n`{type(e).__name__}: {e}`\nسيتم إعادة المحاولة...")
-            time.sleep(5)
+            except Exception as e:
+                consecutive_errors += 1
+                log.exception(f"[{user_id}] خطأ غير متوقع")
+                send(f"🔴 *خطأ:* `{type(e).__name__}`\nإعادة المحاولة...")
+                time.sleep(5)
 
-    # ── انتهاء الجلسة ────────────────────────────────────────────────────
-    sess.close()
-    db_update_points(user_id, st["total_score"], last_score, 0)
-    send(f"🏁 *انتهت الجلسة*\n🏆 الإجمالي النهائي: `{st['total_score']:,}` نقطة")
+    finally:
+        with _threads_lock:
+            _active_threads.pop(user_id, None)
+        sess.close()
+        db_update_points(user_id, st["total_score"], last_score, 0)
+        send(f"🏁 *انتهت الجلسة*\n🏆 الإجمالي: `{st['total_score']:,}` نقطة")
 
 # ===================================================================
-# 9. لوحة المفاتيح (أزرار مضمنة فقط)
+# 12. لوحة المفاتيح
 # ===================================================================
 
 def get_main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("▶️ تشغيل", callback_data="start"),
-            InlineKeyboardButton("⏸ إيقاف مؤقت", callback_data="pause"),
-            InlineKeyboardButton("▶️ استئناف", callback_data="resume"),
+            InlineKeyboardButton("▶️ تشغيل",       callback_data="start"),
+            InlineKeyboardButton("⏸ إيقاف مؤقت",  callback_data="pause"),
+            InlineKeyboardButton("▶️ استئناف",     callback_data="resume"),
         ],
         [
             InlineKeyboardButton("🚀 0.005ث", callback_data="speed_0.005"),
-            InlineKeyboardButton("⚡ 0.02ث", callback_data="speed_0.02"),
-            InlineKeyboardButton("🔥 0.05ث", callback_data="speed_0.05"),
+            InlineKeyboardButton("⚡ 0.02ث",  callback_data="speed_0.02"),
+            InlineKeyboardButton("🔥 0.05ث",  callback_data="speed_0.05"),
         ],
         [
-            InlineKeyboardButton("🐢 0.5ث", callback_data="speed_0.5"),
-            InlineKeyboardButton("🐇 0.2ث", callback_data="speed_0.2"),
+            InlineKeyboardButton("🐢 0.5ث",   callback_data="speed_0.5"),
+            InlineKeyboardButton("🐇 0.2ث",   callback_data="speed_0.2"),
         ],
         [
             InlineKeyboardButton("🚀 تفعيل الرشق", callback_data="enable_rush"),
-            InlineKeyboardButton("⛔ إلغاء الرشق", callback_data="disable_rush"),
+            InlineKeyboardButton("⛔ إلغاء الرشق",  callback_data="disable_rush"),
         ],
         [
-            InlineKeyboardButton("📊 الحالة", callback_data="status"),
+            InlineKeyboardButton("📊 الحالة",       callback_data="status"),
             InlineKeyboardButton("🔄 تغيير الحساب", callback_data="change_account"),
         ],
     ])
 
 # ===================================================================
-# 10. معالجات البوت (Handlers)
+# 13. معالجات البوت
 # ===================================================================
 
 WELCOME = (
@@ -815,50 +960,40 @@ WELCOME = (
     "مثال: `aosnzh`"
 )
 
+@only_allowed
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """بدء المحادثة واستقبال اليوزرنيم."""
     user_id = update.effective_user.id
-    user = db_get_user(user_id)
+    user    = db_get_user(user_id)
     if user and user["session_active"] == 1:
         await update.message.reply_text(
-            "⚠️ *لديك جلسة نشطة بالفعل!*\nاستخدم الأزرار للتحكم.",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
+            "⚠️ *لديك جلسة نشطة!*\nاستخدم الأزرار للتحكم.",
+            parse_mode="Markdown", reply_markup=get_main_keyboard()
         )
         return ConversationHandler.END
 
     await update.message.reply_text(
-        WELCOME,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("❌ إلغاء", callback_data="cancel")
-        ]])
+        WELCOME, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel")]])
     )
     return AWAITING_USERNAME
 
+@only_allowed
 async def handle_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """استقبال اسم المستخدم."""
-    username = update.message.text.strip().lstrip("@")
-    if len(username) < 2:
-        await update.message.reply_text(
-            "❌ اسم المستخدم قصير جداً. حاول مرة أخرى:",
-            parse_mode="Markdown"
-        )
+    ok, result = _validate_username(update.message.text.strip())
+    if not ok:
+        await update.message.reply_text(result, parse_mode="Markdown")
         return AWAITING_USERNAME
-    context.user_data["pending_username"] = username
+    context.user_data["pending_username"] = result
     await update.message.reply_text(
-        f"👤 *اسم المستخدم:* `{username}`\n\n"
-        f"🔑 الآن أرسل *كلمة المرور*:",
+        f"👤 *اسم المستخدم:* `{result}`\n\n🔑 أرسل *كلمة المرور*:",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("❌ إلغاء", callback_data="cancel")
-        ]])
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel")]])
     )
     return AWAITING_PASSWORD
 
+@only_allowed
 async def handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """استقبال كلمة المرور وتنفيذ تسجيل الدخول."""
-    user_id = update.effective_user.id
+    user_id  = update.effective_user.id
     password = update.message.text.strip()
     username = context.user_data.get("pending_username", "")
 
@@ -866,245 +1001,53 @@ async def handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ حدث خطأ. ابدأ من جديد بـ /start")
         return ConversationHandler.END
 
+    ok, err = _validate_password(password)
+    if not ok:
+        await update.message.reply_text(err, parse_mode="Markdown")
+        return AWAITING_PASSWORD
+
     msg = await update.message.reply_text(
-        f"🔄 *جاري تسجيل الدخول...*\n👤 `{username}`",
-        parse_mode="Markdown"
+        f"🔄 *جاري تسجيل الدخول...*\n👤 `{username}`", parse_mode="Markdown"
     )
 
     import asyncio
-    loop = asyncio.get_event_loop()
     sess = make_session()
-    is_ok, feedback, access_token = await loop.run_in_executor(
+    is_ok, feedback, access_token = await asyncio.get_event_loop().run_in_executor(
         None, do_login, username, password, sess
     )
     sess.close()
 
     if not is_ok:
-        await msg.edit_text(
-            f"{feedback}\n\nحاول مرة أخرى أو استخدم /start.",
-            parse_mode="Markdown"
-        )
+        await msg.edit_text(f"{feedback}\n\nحاول مرة أخرى أو /start", parse_mode="Markdown")
         context.user_data.pop("pending_username", None)
         return AWAITING_USERNAME
 
-    # حفظ البيانات في قاعدة البيانات
-    db_save_user(
-        user_id, username, password, access_token,
-        total_points=0, speed=0.2, is_paused=0,
-        last_score=0, start_time=None, session_active=0,
-        target_username=None, order_id=None, rush_enabled=0
-    )
+    db_save_user(user_id, username, password, access_token)
 
-    await msg.edit_text(
-        f"{feedback}\n\n✅ جاهز! استخدم الأزرار للتحكم.",
-        parse_mode="Markdown"
-    )
+    await msg.edit_text(f"{feedback}\n\n✅ جاهز! استخدم الأزرار.", parse_mode="Markdown")
     await update.message.reply_text(
-        "🎛️ *لوحة التحكم جاهزة:*",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
+        "🎛️ *لوحة التحكم:*", parse_mode="Markdown", reply_markup=get_main_keyboard()
     )
     context.user_data.pop("pending_username", None)
     return ConversationHandler.END
 
+@only_allowed
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """إلغاء المحادثة."""
     if update.message:
-        await update.message.reply_text("❌ تم الإلغاء. استخدم /start للبدء من جديد.")
+        await update.message.reply_text("❌ تم الإلغاء. /start للبدء من جديد.")
     context.user_data.pop("pending_username", None)
     return ConversationHandler.END
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالج جميع الأزرار المضمنة."""
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-    action = query.data
-
-    # ── تغيير الحساب ────────────────────────────────────────────────────
-    if action == "change_account":
-        user = db_get_user(user_id)
-        if user and user["session_active"] == 1:
-            await query.edit_message_text(
-                "⚠️ *لديك جلسة نشطة.*\nأوقف الجلسة أولاً ثم غيّر الحساب.",
-                parse_mode="Markdown",
-                reply_markup=get_main_keyboard()
-            )
-            return
-        await query.edit_message_text(
-            WELCOME + "\n\nأرسل اليوزرنيم الجديد:",
-            parse_mode="Markdown"
-        )
-        context.user_data["awaiting_new_account"] = True
-        return
-
-    if action == "cancel":
-        await query.edit_message_text("❌ تم الإلغاء.")
-        return
-
-    user = db_get_user(user_id)
-    if not user or not user["token"]:
-        await query.edit_message_text(
-            "⚠️ *لا يوجد حساب مسجل.*\nاستخدم /start لتسجيل الدخول.",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
-        )
-        return
-
-    # ── تشغيل ───────────────────────────────────────────────────────────
-    if action == "start":
-        if user["session_active"] == 1:
-            await query.edit_message_text(
-                "⏳ *الجمع يعمل بالفعل!*\nاستخدم زر الحالة لرؤية التقدم.",
-                parse_mode="Markdown",
-                reply_markup=get_main_keyboard()
-            )
-            return
-        db_update_pause(user_id, 0)
-        db_update_points(user_id, user["total_points"], user["last_score"], 1)
-        thread = threading.Thread(
-            target=collect_points,
-            args=(user_id, context.bot),
-            daemon=True,
-            name=f"collector-{user_id}"
-        )
-        thread.start()
-        await query.edit_message_text(
-            "🚀 *تم تشغيل جمع النقاط!*\nستصلك رسائل التحديث قريباً.",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
-        )
-
-    # ── إيقاف مؤقت ───────────────────────────────────────────────────────
-    elif action == "pause":
-        if user["session_active"] == 0:
-            await query.edit_message_text(
-                "⚠️ *الجمع ليس قيد التشغيل.*",
-                parse_mode="Markdown",
-                reply_markup=get_main_keyboard()
-            )
-            return
-        if user["is_paused"] == 1:
-            await query.edit_message_text(
-                "⏸ *الجمع متوقف مؤقتاً بالفعل.*",
-                parse_mode="Markdown",
-                reply_markup=get_main_keyboard()
-            )
-            return
-        db_update_pause(user_id, 1)
-        await query.edit_message_text(
-            "⏸ *تم إيقاف الجمع مؤقتاً.*\nاستخدم زر الاستئناف للمتابعة.",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
-        )
-
-    # ── استئناف ──────────────────────────────────────────────────────────
-    elif action == "resume":
-        if user["session_active"] == 0:
-            await query.edit_message_text(
-                "⚠️ *الجمع ليس قيد التشغيل.*\nاضغط تشغيل أولاً.",
-                parse_mode="Markdown",
-                reply_markup=get_main_keyboard()
-            )
-            return
-        if user["is_paused"] == 0:
-            await query.edit_message_text(
-                "▶️ *الجمع يعمل بالفعل.*",
-                parse_mode="Markdown",
-                reply_markup=get_main_keyboard()
-            )
-            return
-        db_update_pause(user_id, 0)
-        await query.edit_message_text(
-            "▶️ *تم استئناف الجمع!*",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
-        )
-
-    # ── تفعيل الرشق ─────────────────────────────────────────────────────
-    elif action == "enable_rush":
-        if user["session_active"] == 0:
-            await query.edit_message_text(
-                "⚠️ *شغّل الجمع أولاً.*",
-                parse_mode="Markdown",
-                reply_markup=get_main_keyboard()
-            )
-            return
-        await query.edit_message_text(
-            "📌 أرسل *اسم المستخدم المستهدف* للرشق (مثال: `aosnzh`):",
-            parse_mode="Markdown"
-        )
-        context.user_data["awaiting_target"] = True
-        return
-
-    # ── إلغاء الرشق ─────────────────────────────────────────────────────
-    elif action == "disable_rush":
-        db_update_rush(user_id, 0)
-        await query.edit_message_text(
-            "⛔ *تم إلغاء وضع الرشق.*",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
-        )
-
-    # ── تغيير السرعة ────────────────────────────────────────────────────
-    elif action.startswith("speed_"):
-        speed = float(action.split("_")[1])
-        db_update_speed(user_id, speed)
-        labels = {
-            0.005: "🚀 أقصى سرعة 0.005ث",
-            0.02:  "⚡ سريع جداً 0.02ث",
-            0.05:  "🔥 سريع 0.05ث",
-            0.2:   "🐇 عادي 0.2ث",
-            0.5:   "🐢 بطيء 0.5ث"
-        }
-        label = labels.get(speed, f"{speed}ث")
-        await query.edit_message_text(
-            f"⚙️ *السرعة الجديدة:* {label}",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
-        )
-
-    # ── الحالة ──────────────────────────────────────────────────────────
-    elif action == "status":
-        running = user["session_active"] == 1
-        paused = user["is_paused"] == 1
-        uptime = "غير متاح"
-        if user["start_time"]:
-            try:
-                start = datetime.fromisoformat(user["start_time"])
-                elapsed = datetime.now() - start
-                hours = int(elapsed.total_seconds() // 3600)
-                minutes = int((elapsed.total_seconds() % 3600) // 60)
-                uptime = f"{hours} ساعة {minutes} دقيقة"
-            except:
-                pass
-
-        await query.edit_message_text(
-            f"📊 *حالة الحساب:*\n\n"
-            f"• الحساب:   `{user['username']}`\n"
-            f"• الحالة:   {'🟢 يعمل' if running else '🔴 متوقف'}\n"
-            f"• الإيقاف:  {'⏸ متوقف' if paused else '▶️ يعمل'}\n"
-            f"• السرعة:   `{user['speed']}ث` بين كل طلب\n"
-            f"• النقاط:   `{user['total_points']:,}` نقطة\n"
-            f"• الحد:     `{MAX_POINTS}` نقطة\n"
-            f"• وقت التشغيل: `{uptime}`\n"
-            f"• المتبقي:   `{max(0, MAX_POINTS - user['total_points'])}` نقطة\n"
-            f"• الرشق:    {'🟢 مفعّل' if user.get('rush_enabled', 0) else '🔴 ملغي'}",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
-        )
-
-# ===================================================================
-# 11. معالج إدخال الهدف للرشق (يُستدعى من مرحلة AWAITING_TARGET)
-# ===================================================================
-
+@only_allowed
 async def handle_target_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """استقبال اسم المستخدم المستهدف للرشق وإنشاء طلب تجريبي."""
-    user_id = update.effective_user.id
-    target = update.message.text.strip().lstrip("@")
+    # يُستدعى فقط إذا كان awaiting_target مضبوطاً
+    if not context.user_data.get("awaiting_target"):
+        return
 
-    if len(target) < 2:
-        await update.message.reply_text("❌ اسم المستخدم قصير جداً.", parse_mode="Markdown")
+    user_id = update.effective_user.id
+    ok, result = _validate_username(update.message.text.strip())
+    if not ok:
+        await update.message.reply_text(result, parse_mode="Markdown")
         return
 
     user = db_get_user(user_id)
@@ -1112,52 +1055,165 @@ async def handle_target_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("⚠️ حدث خطأ في الجلسة.", parse_mode="Markdown")
         return
 
-    msg = await update.message.reply_text(
-        f"🔄 جاري اختبار الرشق على @{target}...",
-        parse_mode="Markdown"
-    )
-
-    # إنشاء طلب رشق تجريبي
-    success, cr_msg, order_id = create_order(user["token"], target, amount=20, initial_count=34)
+    msg     = await update.message.reply_text(f"🔄 جاري اختبار الرشق على @{result}...", parse_mode="Markdown")
+    success, cr_msg, order_id = create_order(user["token"], result)
 
     if success and order_id:
-        db_update_rush(user_id, 1, target, order_id)
+        db_update_rush(user_id, 1, result, order_id)
         await msg.edit_text(
-            f"✅ {cr_msg}\n🆔 `{order_id}`\n\n🔄 سيتم التبديل تلقائياً كل 5 دورات.",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
+            f"✅ {cr_msg}\n🆔 `{order_id}`\n\n🔄 سيتم التبديل كل 5 دورات.",
+            parse_mode="Markdown", reply_markup=get_main_keyboard()
         )
     else:
         await msg.edit_text(
             f"⚠️ فشل الرشق: {cr_msg}\nتأكد من صحة اليوزرنيم.",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
+            parse_mode="Markdown", reply_markup=get_main_keyboard()
         )
 
     context.user_data.pop("awaiting_target", None)
 
+@only_allowed
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query   = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    action  = query.data
+
+    # 🔒 قائمة بيضاء للأزرار المسموح بها
+    ALLOWED_ACTIONS = {
+        "start", "pause", "resume", "status", "change_account", "cancel",
+        "enable_rush", "disable_rush",
+        "speed_0.005", "speed_0.02", "speed_0.05", "speed_0.2", "speed_0.5"
+    }
+    if action not in ALLOWED_ACTIONS:
+        log.warning(f"⚠️ callback غير مسموح [{user_id}]: {action[:30]}")
+        await query.answer("⚠️ طلب غير صالح.", show_alert=True)
+        return
+
+    if action == "cancel":
+        await query.edit_message_text("❌ تم الإلغاء.")
+        return
+
+    if action == "change_account":
+        user = db_get_user(user_id)
+        if user and user["session_active"] == 1:
+            await query.edit_message_text(
+                "⚠️ *أوقف الجلسة أولاً.*", parse_mode="Markdown", reply_markup=get_main_keyboard()
+            )
+            return
+        await query.edit_message_text(WELCOME + "\n\nأرسل اليوزرنيم الجديد:", parse_mode="Markdown")
+        context.user_data["awaiting_new_account"] = True
+        return
+
+    user = db_get_user(user_id)
+    if not user or not user["token"]:
+        await query.edit_message_text(
+            "⚠️ *لا يوجد حساب مسجل.*\nاستخدم /start",
+            parse_mode="Markdown", reply_markup=get_main_keyboard()
+        )
+        return
+
+    if action == "start":
+        with _threads_lock:
+            alive = user_id in _active_threads and _active_threads[user_id].is_alive()
+        if user["session_active"] == 1 or alive:
+            await query.edit_message_text(
+                "⏳ *الجمع يعمل بالفعل!*", parse_mode="Markdown", reply_markup=get_main_keyboard()
+            )
+            return
+        db_update_pause(user_id, 0)
+        db_update_points(user_id, user["total_points"], user["last_score"], 1)
+        t = threading.Thread(target=collect_points, args=(user_id, context.bot),
+                             daemon=True, name=f"collector-{user_id}")
+        t.start()
+        await query.edit_message_text(
+            "🚀 *تم تشغيل جمع النقاط!*", parse_mode="Markdown", reply_markup=get_main_keyboard()
+        )
+
+    elif action == "pause":
+        if user["session_active"] == 0:
+            await query.edit_message_text("⚠️ *الجمع ليس قيد التشغيل.*", parse_mode="Markdown", reply_markup=get_main_keyboard())
+            return
+        if user["is_paused"] == 1:
+            await query.edit_message_text("⏸ *متوقف مؤقتاً بالفعل.*", parse_mode="Markdown", reply_markup=get_main_keyboard())
+            return
+        db_update_pause(user_id, 1)
+        await query.edit_message_text("⏸ *تم الإيقاف المؤقت.*", parse_mode="Markdown", reply_markup=get_main_keyboard())
+
+    elif action == "resume":
+        if user["session_active"] == 0:
+            await query.edit_message_text("⚠️ *اضغط تشغيل أولاً.*", parse_mode="Markdown", reply_markup=get_main_keyboard())
+            return
+        if user["is_paused"] == 0:
+            await query.edit_message_text("▶️ *الجمع يعمل بالفعل.*", parse_mode="Markdown", reply_markup=get_main_keyboard())
+            return
+        db_update_pause(user_id, 0)
+        await query.edit_message_text("▶️ *تم الاستئناف!*", parse_mode="Markdown", reply_markup=get_main_keyboard())
+
+    elif action == "enable_rush":
+        if user["session_active"] == 0:
+            await query.edit_message_text("⚠️ *شغّل الجمع أولاً.*", parse_mode="Markdown", reply_markup=get_main_keyboard())
+            return
+        await query.edit_message_text(
+            "📌 أرسل *اسم المستخدم المستهدف* للرشق (مثال: `aosnzh`):", parse_mode="Markdown"
+        )
+        context.user_data["awaiting_target"] = True
+
+    elif action == "disable_rush":
+        db_update_rush(user_id, 0)
+        await query.edit_message_text("⛔ *تم إلغاء الرشق.*", parse_mode="Markdown", reply_markup=get_main_keyboard())
+
+    elif action.startswith("speed_"):
+        speed  = float(action.split("_")[1])
+        db_update_speed(user_id, speed)
+        labels = {0.005: "🚀 0.005ث", 0.02: "⚡ 0.02ث", 0.05: "🔥 0.05ث", 0.2: "🐇 0.2ث", 0.5: "🐢 0.5ث"}
+        await query.edit_message_text(
+            f"⚙️ *السرعة:* {labels.get(speed, f'{speed}ث')}",
+            parse_mode="Markdown", reply_markup=get_main_keyboard()
+        )
+
+    elif action == "status":
+        uptime = "غير متاح"
+        if user["start_time"]:
+            try:
+                elapsed = datetime.now() - datetime.fromisoformat(user["start_time"])
+                h, m    = int(elapsed.total_seconds() // 3600), int((elapsed.total_seconds() % 3600) // 60)
+                uptime  = f"{h} ساعة {m} دقيقة"
+            except Exception:
+                pass
+        with _threads_lock:
+            alive = user_id in _active_threads and _active_threads[user_id].is_alive()
+
+        await query.edit_message_text(
+            f"📊 *حالة الحساب:*\n\n"
+            f"• الحساب:    `{user['username']}`\n"
+            f"• الحالة:    {'🟢 يعمل' if user['session_active'] and alive else '🔴 متوقف'}\n"
+            f"• الإيقاف:   {'⏸ متوقف' if user['is_paused'] else '▶️ يعمل'}\n"
+            f"• السرعة:    `{user['speed']}ث`\n"
+            f"• النقاط:    `{user['total_points']:,}` نقطة\n"
+            f"• الحد:      `{MAX_POINTS:,}` نقطة\n"
+            f"• المتبقي:   `{max(0, MAX_POINTS - user['total_points']):,}` نقطة\n"
+            f"• التشغيل:   `{uptime}`\n"
+            f"• الرشق:     {'🟢 مفعّل' if user.get('rush_enabled') else '🔴 ملغي'}",
+            parse_mode="Markdown", reply_markup=get_main_keyboard()
+        )
+
 # ===================================================================
-# 12. التشغيل الرئيسي
+# 14. التشغيل الرئيسي
 # ===================================================================
 
 def main():
     init_db()
-    log.info("🤖 البوت يعمل مع قاعدة بيانات وجلسات محفوظة.")
+    log.info("🤖 البوت يعمل — النسخة الآمنة v2.")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            AWAITING_USERNAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_username),
-            ],
-            AWAITING_PASSWORD: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_password),
-            ],
-            AWAITING_TARGET: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_target_input),
-            ],
+            AWAITING_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_username)],
+            AWAITING_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_password)],
+            AWAITING_TARGET:   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_target_input)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
@@ -1168,8 +1224,10 @@ def main():
 
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(button_callback))
+    # معالج للرشق خارج محادثة ConversationHandler
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_target_input))
 
-    log.info("✅ البوت جاهز — اضغط Ctrl+C للإيقاف.")
+    log.info("✅ البوت جاهز.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
