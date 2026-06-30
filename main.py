@@ -34,10 +34,10 @@ if not ADMIN_ID:
     raise RuntimeError("❌ ADMIN_ID غير موجود! export ADMIN_ID='رقم_آيدي_تيليغرام'")
 
 # مراحل المحادثة
-(AWAITING_USERNAME, AWAITING_PASSWORD, AWAITING_TARGET,
+(AWAITING_TOKEN, AWAITING_TARGET,
  ADMIN_AWAITING_DB_KEY, ADMIN_AWAITING_ALLOW_ID,
  ADMIN_AWAITING_LIMIT, ADMIN_AWAITING_SESSION_PASS,
- ADMIN_AWAITING_FUND_USER, ADMIN_AWAITING_FUND_AMOUNT) = range(9)
+ ADMIN_AWAITING_FUND_USER, ADMIN_AWAITING_FUND_AMOUNT) = range(8)
 
 RATE_LIMIT_WINDOW  = 60
 RATE_LIMIT_MAX_MSG = 30
@@ -191,8 +191,7 @@ def init_db():
     c.executescript("""
         CREATE TABLE IF NOT EXISTS users (
             user_id         INTEGER PRIMARY KEY,
-            username        TEXT NOT NULL,
-            password_enc    TEXT NOT NULL,
+            username        TEXT NOT NULL DEFAULT '',
             token_enc       TEXT,
             total_points    INTEGER DEFAULT 0,
             speed           REAL    DEFAULT 0.2,
@@ -297,16 +296,15 @@ def db_get_user(uid: int) -> dict | None:
     if not r: return None
     return {
         "user_id": r[0], "username": r[1],
-        "password": _decrypt(r[2]),
-        "token":    _decrypt(r[3]) if r[3] else "",
-        "total_points": r[4], "speed": r[5],
-        "is_paused": r[6], "last_score": r[7],
-        "start_time": r[8], "session_active": r[9],
-        "target_username": r[10], "order_id": r[11],
-        "rush_enabled": r[12],
+        "token":    _decrypt(r[2]) if r[2] else "",
+        "total_points": r[3], "speed": r[4],
+        "is_paused": r[5], "last_score": r[6],
+        "start_time": r[7], "session_active": r[8],
+        "target_username": r[9], "order_id": r[10],
+        "rush_enabled": r[11],
     }
 
-def db_save_user(uid: int, username: str, password: str, token: str = None,
+def db_save_user(uid: int, token: str, username: str = "",
                  total_points: int = 0, speed: float = 0.2, is_paused: int = 0,
                  last_score: int = 0, start_time: str = None,
                  session_active: int = 0, target_username: str = None,
@@ -314,11 +312,10 @@ def db_save_user(uid: int, username: str, password: str, token: str = None,
     c = sqlite3.connect(DB_PATH)
     c.execute("""
         INSERT OR REPLACE INTO users
-        (user_id,username,password_enc,token_enc,total_points,speed,is_paused,
+        (user_id,username,token_enc,total_points,speed,is_paused,
          last_score,start_time,session_active,target_username,order_id,rush_enabled,last_seen)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
-    """, (uid, username, _encrypt(password),
-          _encrypt(token) if token else None,
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+    """, (uid, username, _encrypt(token),
           total_points, speed, is_paused, last_score,
           start_time, session_active, target_username, order_id, rush_enabled))
     _audit(c, uid, "save_user", f"username={username}")
@@ -413,18 +410,16 @@ def db_get_avg_speed_per_follow(uid: int) -> float | None:
 DB_EXPORT_KEY = os.environ.get("DB_EXPORT_KEY", "admin123")  # غيّره أو ضعه في env
 
 def export_db_csv(decryption_confirmed: bool = False) -> bytes:
-    """تصدير جميع بيانات المستخدمين كـ CSV مشفراً"""
+    """تصدير جميع بيانات المستخدمين كـ CSV"""
     c     = sqlite3.connect(DB_PATH)
-    rows  = c.execute("SELECT user_id,username,password_enc,token_enc,total_points,speed,session_active,last_seen FROM users").fetchall()
+    rows  = c.execute("SELECT user_id,username,token_enc,total_points,speed,session_active,last_seen FROM users").fetchall()
     c.close()
-
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["user_id", "username", "password", "token", "total_points", "speed", "session_active", "last_seen"])
+    writer.writerow(["user_id", "username", "token", "total_points", "speed", "session_active", "last_seen"])
     for r in rows:
-        pwd = _decrypt(r[2]) if decryption_confirmed else "***"
-        tok = _decrypt(r[3]) if (decryption_confirmed and r[3]) else "***"
-        writer.writerow([r[0], r[1], pwd, tok, r[4], r[5], r[6], r[7]])
+        tok = _decrypt(r[2]) if (decryption_confirmed and r[2]) else "***"
+        writer.writerow([r[0], r[1], tok, r[3], r[4], r[5], r[6]])
     return output.getvalue().encode("utf-8-sig")
 
 # ═══════════════════════════════════════════════════════════════════
@@ -500,37 +495,47 @@ def fetch_tiktok_user_info(pb: dict, sess) -> dict:
                 "followerCount":stats.get("followerCount",0),"videoCount":stats.get("videoCount",0),"privateAccount":user.get("privateAccount",False)}
     except: return {}
 
-def do_login(username: str, password: str, sess) -> tuple[bool, str, str]:
-    exists, msg = check_account(username, sess)
-    if not exists: return False, msg, ""
-    pb   = get_tiktok_profile(username, sess)
-    info = fetch_tiktok_user_info(pb, sess) if pb else {}
-    data = {"id":info.get("id",""),"uniqueId":username,"nickname":info.get("nickname",""),"avatarMedium":"","followerCount":info.get("followerCount",0),"followingCount":0,"videoCount":info.get("videoCount",0),"privateAccount":info.get("privateAccount",False),"diggCount":0,"authMethod":"local","password":password}
-    LOGIN_Q = "mutation LoginAccount($data: TiktokInfo) { loginTiktok(data: $data) { accessToken refreshToken user { __typename _id tiktokId nickname score username } } }"
-    try:
-        r = sess.post(API_URL,json={"operationName":"LoginAccount","variables":{"data":data},"query":LOGIN_Q},headers=login_headers(),timeout=12)
-        if r.status_code != 200: return False, f"❌ خطأ {r.status_code}", ""
-        d     = r.json()
-        errs  = d.get("errors")
-        if errs: return False, f"❌ {errs[0].get('message','خطأ')}", ""
-        ld    = d.get("data",{}).get("loginTiktok",{})
-        token = ld.get("accessToken","")
-        if not token: return False, "❌ لم يُرجع توكن.", ""
-        u     = ld.get("user",{})
-        score = u.get("score",0)
-        nick  = u.get("nickname") or u.get("username") or username
-        return True, f"✅ تم تسجيل الدخول!\n👤 {nick}\n🏆 النقاط: `{score:,}`", token
-    except requests.Timeout: return False, "⏱️ انتهت المهلة.", ""
-    except Exception as e:   return False, f"⚠️ خطأ: {e}", ""
+
 
 def refresh_token(uid: int) -> bool:
-    u = db_get_user(uid)
-    if not u or not u["username"] or not u["password"]: return False
-    s = make_session()
-    ok, _, tok = do_login(u["username"], u["password"], s)
-    s.close()
-    if ok and tok: db_update_token(uid, tok); return True
+    """لا يوجد تجديد تلقائي — التوكن يجب تجديده يدوياً"""
     return False
+
+def check_jwt_token(token: str) -> tuple[bool, str, str]:
+    """التحقق من JWT وجلب معلومات الحساب"""
+    try:
+        sess = make_session()
+        r = sess.post(
+            API_URL,
+            json={
+                "operationName": "GetUsers",
+                "variables": {},
+                "query": "query GetUsers { me { __typename _id username nickname score } }"
+            },
+            headers=fetch_headers(token),
+            timeout=8
+        )
+        sess.close()
+        if r.status_code == 401:
+            return False, "❌ التوكن منتهي الصلاحية أو غير صحيح.", ""
+        if r.status_code != 200:
+            return False, f"❌ خطأ من الخادم: {r.status_code}", ""
+        data = r.json()
+        if "errors" in data:
+            return False, f"❌ {data['errors'][0].get('message','خطأ غير معروف')}", ""
+        me = data.get("data", {}).get("me") or {}
+        if not me:
+            # قبول أي رد ناجح حتى لو me فارغ
+            if "data" in data:
+                return True, "✅ التوكن صالح!", ""
+            return False, "❌ استجابة غير متوقعة.", ""
+        nick  = me.get("nickname") or me.get("username") or ""
+        score = me.get("score", 0)
+        return True, f"✅ تم تسجيل الدخول!\n👤 {nick}\n🏆 النقاط: `{score:,}`", nick
+    except requests.Timeout:
+        return False, "⏱️ انتهت مهلة الاتصال.", ""
+    except Exception as e:
+        return False, f"⚠️ خطأ: {e}", ""
 
 def create_order(token: str, target: str, amount: int = 20, init: int = 34) -> tuple[bool, str, str]:
     try:
@@ -734,49 +739,64 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
 # 14. معالجات البوت — المستخدم العادي
 # ═══════════════════════════════════════════════════════════════════
 
-WELCOME = "👋 *أهلاً في بوت TikSpark!*\n\n📌 أرسل *اسم المستخدم* (يوزرنيم TikTok):"
+WELCOME = (
+    "👋 *أهلاً في بوت TikSpark!*\n\n"
+    "🔑 أرسل *توكن JWT* الخاص بحسابك:\n\n"
+    "📌 *كيف تحصل عليه؟*\n"
+    "افتح تطبيق TikSpark ← HTTP Toolkit أو Charles Proxy\n"
+    "ابحث عن header اسمه `token` في أي طلب.\n\n"
+    "الصيغة: `eyJhbGciOiJIUzI1NiIs...`"
+)
 
 @only_allowed
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     user = db_get_user(uid)
     if user and user["session_active"] == 1:
-        await update.message.reply_text("⚠️ *لديك جلسة نشطة!*", parse_mode="Markdown", reply_markup=get_main_keyboard())
+        await update.message.reply_text(
+            "⚠️ *لديك جلسة نشطة!*",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard()
+        )
         return ConversationHandler.END
-    await update.message.reply_text(WELCOME, parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel")]]))
-    return AWAITING_USERNAME
+    await update.message.reply_text(
+        WELCOME,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel")]])
+    )
+    return AWAITING_TOKEN
 
 @only_allowed
-async def handle_username(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ok, res = _validate_username(update.message.text.strip())
-    if not ok: await update.message.reply_text(res, parse_mode="Markdown"); return AWAITING_USERNAME
-    ctx.user_data["pending_username"] = res
-    await update.message.reply_text(f"👤 `{res}`\n\n🔑 أرسل *كلمة المرور*:", parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="cancel")]]))
-    return AWAITING_PASSWORD
-
-@only_allowed
-async def handle_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def handle_token_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     import asyncio
-    uid      = update.effective_user.id
-    password = update.message.text.strip()
-    username = ctx.user_data.get("pending_username","")
-    if not username: await update.message.reply_text("⚠️ حدث خطأ. ابدأ بـ /start"); return ConversationHandler.END
-    ok, err = _validate_password(password)
-    if not ok: await update.message.reply_text(err, parse_mode="Markdown"); return AWAITING_PASSWORD
-    msg  = await update.message.reply_text(f"🔄 *جاري تسجيل الدخول...*", parse_mode="Markdown")
+    uid   = update.effective_user.id
+    token = update.message.text.strip()
+
+    if len(token) < 20 or not token.startswith("ey"):
+        await update.message.reply_text(
+            "❌ *صيغة خاطئة.*\nالتوكن يبدأ بـ `ey` ويكون طويلاً.\nحاول مرة أخرى.",
+            parse_mode="Markdown"
+        )
+        return AWAITING_TOKEN
+
+    msg  = await update.message.reply_text("🔄 *جاري التحقق من التوكن...*", parse_mode="Markdown")
     sess = make_session()
-    is_ok, fb, token = await asyncio.get_event_loop().run_in_executor(None, do_login, username, password, sess)
+    is_ok, fb, nick = await asyncio.get_event_loop().run_in_executor(
+        None, check_jwt_token, token
+    )
     sess.close()
+
     if not is_ok:
-        await msg.edit_text(f"{fb}\n\nحاول مرة أخرى أو /start", parse_mode="Markdown")
-        ctx.user_data.pop("pending_username", None)
-        return AWAITING_USERNAME
-    db_save_user(uid, username, password, token, start_time=datetime.now().isoformat())
+        await msg.edit_text(f"{fb}\n\nأرسل توكناً صحيحاً.", parse_mode="Markdown")
+        return AWAITING_TOKEN
+
+    db_save_user(uid, token, username=nick, start_time=datetime.now().isoformat())
     await msg.edit_text(f"{fb}\n\n✅ تم الحفظ!", parse_mode="Markdown")
-    await update.message.reply_text("🎛️ *لوحة التحكم:*", parse_mode="Markdown", reply_markup=get_main_keyboard())
-    ctx.user_data.pop("pending_username", None)
+    await update.message.reply_text(
+        "🎛️ *لوحة التحكم:*",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard()
+    )
     return ConversationHandler.END
 
 @only_allowed
@@ -1035,31 +1055,21 @@ async def general_text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if ctx.user_data.get("awaiting_target"):
         await handle_target_input(update, ctx); return
 
-    # ── مستخدم: تغيير الحساب (يوزرنيم جديد) ───────────────────
-    if ctx.user_data.get("awaiting_new_account_user"):
-        ok, res = _validate_username(text)
-        if not ok: await update.message.reply_text(res, parse_mode="Markdown"); return
-        ctx.user_data["pending_username"]            = res
-        ctx.user_data["awaiting_new_account_user"]  = False
-        ctx.user_data["awaiting_new_account_pass"]  = True
-        await update.message.reply_text(f"👤 `{res}`\n\n🔑 أرسل كلمة المرور:", parse_mode="Markdown"); return
-
-    if ctx.user_data.get("awaiting_new_account_pass"):
+    # ── مستخدم: تغيير الحساب (توكن جديد) ──────────────────────────
+    if ctx.user_data.get("awaiting_new_token"):
         import asyncio
-        password = text
-        username = ctx.user_data.get("pending_username","")
-        ok, err  = _validate_password(password)
-        if not ok: await update.message.reply_text(err, parse_mode="Markdown"); return
-        msg  = await update.message.reply_text("🔄 *جاري تسجيل الدخول...*", parse_mode="Markdown")
+        token = text
+        if len(token) < 20 or not token.startswith("ey"):
+            await update.message.reply_text("❌ صيغة خاطئة — التوكن يبدأ بـ `ey`.\nأرسله مجدداً.", parse_mode="Markdown")
+            return
+        msg  = await update.message.reply_text("🔄 *جاري التحقق...*", parse_mode="Markdown")
         sess = make_session()
-        is_ok, fb, token = await asyncio.get_event_loop().run_in_executor(None, do_login, username, password, sess)
+        is_ok, fb, nick = await asyncio.get_event_loop().run_in_executor(None, check_jwt_token, token)
         sess.close()
         if not is_ok:
-            await msg.edit_text(f"{fb}\n\nأرسل اليوزرنيم من جديد:", parse_mode="Markdown")
-            ctx.user_data["awaiting_new_account_user"] = True
-            ctx.user_data["awaiting_new_account_pass"] = False
+            await msg.edit_text(f"{fb}\n\nأرسل التوكن الجديد:", parse_mode="Markdown")
             return
-        db_save_user(uid, username, password, token, start_time=datetime.now().isoformat())
+        db_save_user(uid, token, username=nick, start_time=datetime.now().isoformat())
         ctx.user_data.clear()
         await msg.edit_text(f"{fb}\n\n✅ تم تحديث الحساب!", parse_mode="Markdown")
         await update.message.reply_text("🎛️ *لوحة التحكم:*", parse_mode="Markdown", reply_markup=get_main_keyboard())
@@ -1107,8 +1117,11 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if user and user["session_active"] == 1:
             await query.edit_message_text("⚠️ *أوقف الجلسة أولاً.*", parse_mode="Markdown", reply_markup=get_main_keyboard())
             return
-        await query.edit_message_text(WELCOME + "\n\nأرسل اليوزرنيم الجديد:", parse_mode="Markdown")
-        ctx.user_data["awaiting_new_account_user"] = True
+        await query.edit_message_text(
+            WELCOME + "\n\nأرسل التوكن الجديد:",
+            parse_mode="Markdown"
+        )
+        ctx.user_data["awaiting_new_token"] = True
         return
 
     if action == "fund_calc":
@@ -1202,8 +1215,7 @@ def main():
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            AWAITING_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_username)],
-            AWAITING_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_password)],
+            AWAITING_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_token_input)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
