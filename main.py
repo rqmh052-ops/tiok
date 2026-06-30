@@ -504,36 +504,39 @@ def refresh_token(uid: int) -> bool:
     return False
 
 def check_jwt_token(token: str) -> tuple[bool, str, str]:
-    """التحقق من JWT وجلب معلومات الحساب"""
+    """التحقق من التوكن عبر FetchOrders — نفس منطق TikSpark.py"""
     try:
         sess = make_session()
         r = sess.post(
             API_URL,
             json={
-                "operationName": "GetUsers",
-                "variables": {},
-                "query": "query GetUsers { me { __typename _id username nickname score } }"
+                "operationName": "FetchOrders",
+                "variables": {"page": 2},
+                "query": "query FetchOrders($page: Int!) { getOrders(page: $page) { _id score } }"
             },
             headers=fetch_headers(token),
-            timeout=8
+            timeout=10
         )
         sess.close()
+
         if r.status_code == 401:
             return False, "❌ التوكن منتهي الصلاحية أو غير صحيح.", ""
         if r.status_code != 200:
             return False, f"❌ خطأ من الخادم: {r.status_code}", ""
+
         data = r.json()
         if "errors" in data:
-            return False, f"❌ {data['errors'][0].get('message','خطأ غير معروف')}", ""
-        me = data.get("data", {}).get("me") or {}
-        if not me:
-            # قبول أي رد ناجح حتى لو me فارغ
-            if "data" in data:
-                return True, "✅ التوكن صالح!", ""
+            msg = data["errors"][0].get("message", "خطأ غير معروف")
+            return False, f"❌ {msg}", ""
+
+        orders = data.get("data", {}).get("getOrders", [])
+        # لو رجعت قائمة (حتى لو فاضية) يبقى التوكن شغال
+        if orders is None:
             return False, "❌ استجابة غير متوقعة.", ""
-        nick  = me.get("nickname") or me.get("username") or ""
-        score = me.get("score", 0)
-        return True, f"✅ تم تسجيل الدخول!\n👤 {nick}\n🏆 النقاط: `{score:,}`", nick
+
+        score = orders[0].get("score", 0) if orders else 0
+        return True, f"✅ تم تسجيل الدخول!\n🏆 النقاط الحالية: `{score:,}`", ""
+
     except requests.Timeout:
         return False, "⏱️ انتهت مهلة الاتصال.", ""
     except Exception as e:
