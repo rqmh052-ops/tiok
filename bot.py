@@ -106,6 +106,7 @@ def db_init():
         ("login",   json.dumps(LOGIN_HEADERS_DEFAULT)),
         ("fetch",   json.dumps(FETCH_HEADERS_DEFAULT)),
         ("action",  json.dumps(ACTION_HEADERS_DEFAULT)),
+        ("score",   json.dumps(SCORE_HEADERS_DEFAULT)),
     ]:
         c.execute("INSERT OR IGNORE INTO headers (htype,data) VALUES (?,?)", (htype, hdata))
 
@@ -286,6 +287,20 @@ ACTION_HEADERS_DEFAULT = {
     "x-app-ts":    "1782443501268",
     "x-app-nonce": "e69a0252b53843e4"
 }
+SCORE_HEADERS_DEFAULT = {
+    "User-Agent": "okhttp/4.12.0",
+    "Accept": "multipart/mixed; deferSpec=20220824, application/json",
+    "Accept-Encoding": "gzip",
+    "Content-Type": "application/json",
+    "x-apollo-operation-id": "88d30eeca55c0538539ad8217dfefd52b2f47015200cdbb7cb6ea5a765381d69",
+    "x-apollo-operation-name": "FetchScore",
+    "x-language": "ar",
+    "x-app-name": "com.dev.vidspark",
+    "x-device-info": '{"d":"30316661383133663939383030616638","n":"494e46494e495820496e66696e6978205836373238","o":"15","t":"d","v":"2.2.0","s":"0,0"}',
+    "x-app-sig":   "0a379ca66291f1be26a0f9c810858bb56a0726b9349547841bada3eb59514174",
+    "x-app-ts":    "1782956082100",
+    "x-app-nonce": "bf3b167cdff645f0"
+}
 
 # ═══════════════════════════════════════════════
 #  📦  دوال API (محمية - لا تُعدَّل)
@@ -386,6 +401,27 @@ def execute_order(token, order_id):
     except Exception:
         return None
 
+def fetch_real_score(token):
+    """يجلب الرصيد الحقيقي للمستخدم من FetchScore API"""
+    try:
+        headers = db_get_headers("score")
+        headers["token"] = token
+        payload = {
+            "operationName": "FetchScore",
+            "variables": {},
+            "query": "query FetchScore { fetchScore }"
+        }
+        resp = requests.post(API_URL, json=payload, headers=headers, timeout=8)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        score = data.get("data", {}).get("fetchScore")
+        if score is not None:
+            return int(score)
+        return None
+    except Exception:
+        return None
+
 # ═══════════════════════════════════════════════
 #  🧵  كلاس الجلسة + Loop
 # ═══════════════════════════════════════════════
@@ -418,12 +454,23 @@ def collector_loop(session: Session, bot, chat_id, loop):
     token      = session.token
     last_score = 0
     cons_err   = 0
+    # نجلب الرصيد الأولي قبل البدء
+    initial_score = fetch_real_score(token)
+    if initial_score is not None:
+        last_score          = initial_score
+        session.total_score = initial_score
+    score_fetch_counter = 0  # نجلب الرصيد الحقيقي كل N مهمة
 
     def safe_send(text, markup=None):
         coro = _edit_or_send(bot, chat_id, session, text, markup)
         asyncio.run_coroutine_threadsafe(coro, loop)
 
-    safe_send("🚀 *جارٍ الجمع...*\n⏳ انتظر أول تحديث.")
+    safe_send(
+        f"🚀 *بدأت الجلسة*\n"
+        f"👤 `{session.tiktok_user}`\n"
+        f"💰 الرصيد الحالي: `{last_score:,}`\n"
+        f"⏳ *جارٍ جمع النقاط...*"
+    )
 
     while not session.stop_flag:
         try:
@@ -453,37 +500,60 @@ def collector_loop(session: Session, bot, chat_id, loop):
                 continue
 
             cons_err = 0
-            score = result.get("score", last_score)
             prog  = result.get("taskProgress", {})
             count = prog.get("count", session.task_count)
+            session.task_count = count
+            score_fetch_counter += 1
 
-            if score < last_score:
-                score = last_score
-            gained     = max(0, score - last_score)
-            last_score = score
-            session.last_score  = score
+            # كل 3 مهام نجلب الرصيد الحقيقي من FetchScore
+            if score_fetch_counter % 3 == 0 or score_fetch_counter == 1:
+                real_score = fetch_real_score(token)
+                if real_score is not None and real_score >= last_score:
+                    score      = real_score
+                    last_score = real_score
+                else:
+                    # fallback: نستخدم score من actionOrder كزيادة فقط
+                    task_score = result.get("score", 0)
+                    score      = last_score + max(0, task_score)
+                    last_score = score
+            else:
+                # بين الاستعلامات: نزيد بقيمة المهمة فقط تقريباً
+                task_score = result.get("score", 0)
+                score      = last_score + max(0, task_score) if task_score > 0 else last_score
+                last_score = score
+
+            gained = max(0, score - session.total_score)
             session.total_score = score
-            session.task_count  = count
 
             db_update_session(session.db_id, score, count)
 
-            bar    = "█" * min(count, 10) + "░" * (10 - min(count, 10))
-            badge  = f"🎉 +{gained}" if gained > 0 else "⏳"
             elapsed = (datetime.now() - session.start_time).total_seconds()
-            rate   = count / elapsed if elapsed > 0 else 0
+            rate    = count / elapsed if elapsed > 0 else 0
+            mins    = int(elapsed // 60)
+            secs    = int(elapsed % 60)
+
+            # شريط تقدم المهام
+            prog_limit = prog.get("taskProgressLimit", 10)
+            filled     = min(count % (prog_limit or 10), 10)
+            bar        = "🟦" * filled + "⬜" * (10 - filled)
+
+            badge = f"✨ +{gained:,}" if gained > 0 else "🔄"
 
             text = (
-                f"🏃 *جلسة نشطة — {session.tiktok_user}*\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"{badge}\n"
-                f"🏆 النقاط: `{score:,}`\n"
-                f"📦 المهام: `{count}` `[{bar}]`\n"
-                f"⚡ السرعة: `{session.speed}ث`\n"
-                f"📈 المعدل: `{rate:.1f}` مهمة/ث\n"
-                f"⏱ المدة: `{int(elapsed//60)}د {int(elapsed%60)}ث`"
+                f"⚡ *جلسة نشطة*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 `{session.tiktok_user}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"💰 *النقاط:* `{score:,}` {badge}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📦 *المهام:* `{count}`\n"
+                f"{bar}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🚀 السرعة: `{session.speed}ث`  |  📈 `{rate:.1f}` م/ث\n"
+                f"⏱ المدة: `{mins}د {secs:02d}ث`"
             )
             kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("⏹ إيقاف هذه الجلسة", callback_data=f"stop_{session.id}")
+                InlineKeyboardButton("⏹ إيقاف الجلسة", callback_data=f"stop_{session.id}")
             ]])
             safe_send(text, kb)
             time.sleep(session.speed)
@@ -497,14 +567,22 @@ def collector_loop(session: Session, bot, chat_id, loop):
             time.sleep(2)
 
     session.running = False
+    # نجلب الرصيد النهائي الحقيقي
+    final_score = fetch_real_score(token)
+    if final_score is not None:
+        session.total_score = final_score
     db_update_session(session.db_id, session.total_score, session.task_count, "stopped")
     elapsed = (datetime.now() - session.start_time).total_seconds()
+    kb_done = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 الرئيسية", callback_data="back_main")]])
     safe_send(
         f"🏁 *انتهت الجلسة*\n"
-        f"👤 {session.tiktok_user}\n"
-        f"🏆 النهائي: `{session.total_score:,}`\n"
-        f"📦 المهام: `{session.task_count}`\n"
-        f"⏱ المدة: `{int(elapsed//60)}د {int(elapsed%60)}ث`"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 `{session.tiktok_user}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 *النقاط النهائية:* `{session.total_score:,}`\n"
+        f"📦 *المهام المنجزة:* `{session.task_count}`\n"
+        f"⏱ *المدة الكلية:* `{int(elapsed//60)}د {int(elapsed%60):02d}ث`",
+        kb_done
     )
 
 async def _edit_or_send(bot, chat_id, session: Session, text, markup=None):
@@ -526,27 +604,25 @@ async def _edit_or_send(bot, chat_id, session: Session, text, markup=None):
 def kb_main(user_id):
     is_admin = (user_id == ADMIN_ID)
     rows = [
-        [InlineKeyboardButton("➕ جلسة جديدة",       callback_data="new_session"),
-         InlineKeyboardButton("📊 حالتي",             callback_data="my_status")],
-        [InlineKeyboardButton("📋 جلساتي",            callback_data="my_sessions"),
-         InlineKeyboardButton("⚡ تغيير السرعة",       callback_data="speed_menu")],
+        [InlineKeyboardButton("🚀 بدء جلسة جديدة",    callback_data="new_session")],
+        [InlineKeyboardButton("📊 الجلسات النشطة",     callback_data="my_status"),
+         InlineKeyboardButton("📋 سجل جلساتي",         callback_data="my_sessions")],
+        [InlineKeyboardButton("⚡ تغيير السرعة",        callback_data="speed_menu")],
     ]
     if is_admin:
-        rows.append([
-            InlineKeyboardButton("🛡 لوحة الإدارة",   callback_data="admin_panel"),
-        ])
+        rows.append([InlineKeyboardButton("🛡 لوحة الإدارة", callback_data="admin_panel")])
     return InlineKeyboardMarkup(rows)
 
 def kb_admin():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 إدارة المستخدمين",  callback_data="adm_users"),
-         InlineKeyboardButton("📋 كل الجلسات",        callback_data="adm_sessions")],
-        [InlineKeyboardButton("🔧 تحديث الهيدرز",     callback_data="adm_headers"),
-         InlineKeyboardButton("⚡ إدارة السرعات",      callback_data="adm_speeds")],
-        [InlineKeyboardButton("💾 تنزيل قاعدة البيانات", callback_data="adm_dl_db"),
-         InlineKeyboardButton("📤 رفع قاعدة البيانات",   callback_data="adm_ul_db")],
-        [InlineKeyboardButton("⏹ إيقاف كل الجلسات",  callback_data="adm_stop_all")],
-        [InlineKeyboardButton("🔙 الرئيسية",           callback_data="back_main")],
+        [InlineKeyboardButton("👥 المستخدمون",         callback_data="adm_users"),
+         InlineKeyboardButton("📋 كل الجلسات",         callback_data="adm_sessions")],
+        [InlineKeyboardButton("🔧 تحديث الهيدرز",      callback_data="adm_headers"),
+         InlineKeyboardButton("⚡ السرعات",             callback_data="adm_speeds")],
+        [InlineKeyboardButton("💾 تنزيل DB",            callback_data="adm_dl_db"),
+         InlineKeyboardButton("📤 رفع DB",              callback_data="adm_ul_db")],
+        [InlineKeyboardButton("⏹ إيقاف كل الجلسات",   callback_data="adm_stop_all")],
+        [InlineKeyboardButton("🔙 رجوع للرئيسية",      callback_data="back_main")],
     ])
 
 def kb_speed(user_id):
@@ -562,21 +638,21 @@ def kb_speed(user_id):
     if user_id == ADMIN_ID:
         rows.append([InlineKeyboardButton("➕ إضافة سرعة",   callback_data="adm_add_speed"),
                      InlineKeyboardButton("🗑 حذف سرعة",     callback_data="adm_del_speed_menu")])
-    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="back_main")])
+    rows.append([InlineKeyboardButton("🔙 رجوع للرئيسية", callback_data="back_main")])
     return InlineKeyboardMarkup(rows)
 
-def kb_back(target="back_main"):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data=target)]])
+def kb_back(target="back_main", label="🔙 رجوع"):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=target)]])
 
 def kb_users(users):
     rows = []
     for u in users:
         rows.append([InlineKeyboardButton(
-            f"🚫 حذف {u['username'] or u['user_id']}",
+            f"🚫 إزالة {u['username'] or u['user_id']}",
             callback_data=f"adm_rm_user_{u['user_id']}"
         )])
     rows.append([InlineKeyboardButton("➕ إضافة مستخدم", callback_data="adm_add_user")])
-    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")])
+    rows.append([InlineKeyboardButton("🔙 رجوع للإدارة", callback_data="admin_panel")])
     return InlineKeyboardMarkup(rows)
 
 def kb_del_speed(speeds):
@@ -586,7 +662,7 @@ def kb_del_speed(speeds):
             f"🗑 {s['label']} ({s['value']}ث)",
             callback_data=f"adm_del_speed_{s['id']}"
         )])
-    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="adm_speeds")])
+    rows.append([InlineKeyboardButton("🔙 رجوع للسرعات", callback_data="adm_speeds")])
     return InlineKeyboardMarkup(rows)
 
 # ═══════════════════════════════════════════════
@@ -595,13 +671,21 @@ def kb_del_speed(speeds):
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not db_is_allowed(uid):
-        await update.message.reply_text("⛔️ ليس لديك صلاحية لاستخدام هذا البوت.")
+        await update.message.reply_text(
+            "⛔️ *ليس لديك صلاحية*\n"
+            "تواصل مع الأدمن للحصول على الوصول.",
+            parse_mode="Markdown"
+        )
         return
     name = update.effective_user.first_name or "مستخدم"
+    is_admin = (uid == ADMIN_ID)
+    role_badge = "👑 *أدمن*" if is_admin else "👤 *مستخدم*"
     await update.message.reply_text(
-        f"👋 أهلاً *{name}*!\n\n"
-        f"🤖 *بوت TikSpark* جاهز للعمل.\n"
-        f"اختر من الأزرار أدناه:",
+        f"👋 أهلاً *{name}*! {role_badge}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🤖 *بوت TikSpark* جاهز للعمل\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"اختر ما تريد من الأزرار أدناه 👇",
         parse_mode="Markdown",
         reply_markup=kb_main(uid)
     )
@@ -620,14 +704,23 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── رجوع للرئيسية ──────────────────────────
     if data == "back_main":
         await q.edit_message_text(
-            "🏠 *الرئيسية*", parse_mode="Markdown", reply_markup=kb_main(uid)
+            f"🏠 *الرئيسية*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"اختر ما تريد 👇",
+            parse_mode="Markdown", reply_markup=kb_main(uid)
         )
         return
 
     # ── قائمة السرعات ──────────────────────────
     if data == "speed_menu":
+        current = ctx.user_data.get("selected_speed", 0.2)
         await q.edit_message_text(
-            "⚡ *اختر سرعة الجمع:*\n_(تُطبَّق على جلستك التالية أو الحالية)_",
+            f"⚡ *إعداد سرعة الجمع*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"السرعة الحالية: `{current}ث`\n"
+            f"_(تُطبَّق على الجلسة التالية أو الحالية)_\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"اختر سرعة 👇",
             parse_mode="Markdown", reply_markup=kb_speed(uid)
         )
         return
@@ -650,8 +743,14 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     if s.user_id == uid and s.running:
                         s.speed = speed_val
             await q.edit_message_text(
-                f"✅ السرعة: *{speed_label}* `({speed_val}ث)`",
-                parse_mode="Markdown", reply_markup=kb_speed(uid)
+                f"✅ *تم تغيير السرعة*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"{speed_label} — `{speed_val}ث`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⚡ تغيير السرعة مجدداً", callback_data="speed_menu")],
+                    [InlineKeyboardButton("🔙 رجوع للرئيسية", callback_data="back_main")],
+                ])
             )
         except ValueError:
             await q.answer("❌ خطأ", show_alert=True)
@@ -661,8 +760,11 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "new_session":
         ctx.user_data["awaiting"] = "username"
         await q.edit_message_text(
-            "👤 أرسل *اسم المستخدم* (TikTok):",
-            parse_mode="Markdown", reply_markup=kb_back()
+            f"🚀 *بدء جلسة جديدة*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 أرسل *اسم المستخدم* في التطبيق:",
+            parse_mode="Markdown",
+            reply_markup=kb_back("back_main", "❌ إلغاء")
         )
         return
 
@@ -675,13 +777,17 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         with sessions_lock:
             s = sessions.get(target_id)
         if not s:
-            await q.answer("⚠️ الجلسة غير موجودة", show_alert=True); return
+            await q.answer("⚠️ الجلسة غير موجودة أو انتهت", show_alert=True); return
         if s.user_id != uid and uid != ADMIN_ID:
             await q.answer("⛔️ ليست جلستك", show_alert=True); return
         s.stop_flag = True
         await q.edit_message_text(
-            f"⏹ *جارٍ إيقاف* `{s.tiktok_user}`...",
-            parse_mode="Markdown"
+            f"⏹ *جارٍ إيقاف الجلسة...*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 `{s.tiktok_user}`\n"
+            f"⏳ انتظر لحظة...",
+            parse_mode="Markdown",
+            reply_markup=kb_back("back_main", "🏠 الرئيسية")
         )
         return
 
@@ -690,7 +796,16 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         with sessions_lock:
             active = [s for s in sessions.values() if s.user_id == uid and s.running]
         if not active:
-            await q.edit_message_text("📭 لا توجد جلسات نشطة لك.", reply_markup=kb_main(uid))
+            await q.edit_message_text(
+                "📭 *لا توجد جلسات نشطة*\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "ابدأ جلسة جديدة من الرئيسية 👇",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🚀 جلسة جديدة", callback_data="new_session")],
+                    [InlineKeyboardButton("🔙 رجوع", callback_data="back_main")],
+                ])
+            )
             return
         lines = []
         btns  = []
@@ -698,15 +813,18 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             elapsed = (datetime.now() - s.start_time).total_seconds() if s.start_time else 0
             lines.append(
                 f"🟢 *{s.tiktok_user}*\n"
-                f"   🏆 `{s.total_score:,}` | 📦 `{s.task_count}` | ⚡ `{s.speed}ث`\n"
-                f"   ⏱ `{int(elapsed//60)}د {int(elapsed%60)}ث`"
+                f"   💰 `{s.total_score:,}` نقطة | 📦 `{s.task_count}` مهمة\n"
+                f"   🚀 `{s.speed}ث` | ⏱ `{int(elapsed//60)}د {int(elapsed%60):02d}ث`"
             )
             btns.append([InlineKeyboardButton(
                 f"⏹ إيقاف {s.tiktok_user}", callback_data=f"stop_{s.id}"
             )])
-        btns.append([InlineKeyboardButton("🔙 رجوع", callback_data="back_main")])
+        btns.append([InlineKeyboardButton("🔄 تحديث", callback_data="my_status")])
+        btns.append([InlineKeyboardButton("🔙 رجوع للرئيسية", callback_data="back_main")])
         await q.edit_message_text(
-            "📊 *جلساتك النشطة:*\n\n" + "\n\n".join(lines),
+            f"📊 *الجلسات النشطة* ({len(active)})\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            + "\n\n".join(lines),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(btns)
         )
@@ -716,13 +834,23 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "my_sessions":
         rows = db_list_sessions(uid)
         if not rows:
-            await q.edit_message_text("📭 لا توجد جلسات سابقة.", reply_markup=kb_main(uid))
+            await q.edit_message_text(
+                "📭 *لا توجد جلسات سابقة*",
+                parse_mode="Markdown",
+                reply_markup=kb_back("back_main", "🔙 رجوع للرئيسية")
+            )
             return
-        text = "📋 *جلساتك الأخيرة:*\n\n"
+        text = f"📋 *سجل جلساتك الأخيرة*\n━━━━━━━━━━━━━━━━━━━━\n\n"
         for r in rows:
             icon = "🟢" if r["status"] == "running" else "🔴"
-            text += f"{icon} `{r['tiktok_user']}` — 🏆 `{r['total_score']:,}` — 📦 `{r['task_count']}`\n"
-        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb_back())
+            text += (
+                f"{icon} `{r['tiktok_user']}`\n"
+                f"   💰 `{r['total_score']:,}` | 📦 `{r['task_count']}` مهمة\n"
+            )
+        await q.edit_message_text(
+            text, parse_mode="Markdown",
+            reply_markup=kb_back("back_main", "🔙 رجوع للرئيسية")
+        )
         return
 
     # ═══════ لوحة الإدارة ═══════════════════════
@@ -734,9 +862,11 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         total_users = len(db_list_users())
         await q.edit_message_text(
             f"🛡 *لوحة الإدارة*\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🟢 الجلسات النشطة: `{active_count}`\n"
-            f"👥 المستخدمون المصرح لهم: `{total_users}`",
+            f"👥 المستخدمون المصرح: `{total_users}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"اختر الإجراء 👇",
             parse_mode="Markdown",
             reply_markup=kb_admin()
         )
@@ -746,11 +876,11 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if uid != ADMIN_ID:
             await q.answer("⛔️", show_alert=True); return
         users = db_list_users()
-        text  = "👥 *المستخدمون المصرح لهم:*\n\n"
+        text  = f"👥 *المستخدمون المصرح لهم*\n━━━━━━━━━━━━━━━━━━━━\n\n"
         if not users:
-            text += "_(لا يوجد مستخدمون مضافون)_"
+            text += "_(لا يوجد مستخدمون مضافون حتى الآن)_"
         for u in users:
-            text += f"• `{u['user_id']}` — @{u['username'] or '—'} — منذ {u['added_at'][:10]}\n"
+            text += f"• `{u['user_id']}` — @{u['username'] or '—'} — {u['added_at'][:10]}\n"
         await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb_users(users))
         return
 
@@ -759,8 +889,12 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer("⛔️", show_alert=True); return
         ctx.user_data["awaiting"] = "adm_add_user"
         await q.edit_message_text(
-            "➕ أرسل *معرف المستخدم (ID)* أو @اسمه لإضافته:",
-            parse_mode="Markdown", reply_markup=kb_back("adm_users")
+            f"➕ *إضافة مستخدم جديد*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"أرسل *معرف المستخدم (ID)* الرقمي\n"
+            f"_(يمكنك الحصول عليه من @userinfobot)_",
+            parse_mode="Markdown",
+            reply_markup=kb_back("adm_users", "❌ إلغاء")
         )
         return
 
@@ -770,24 +904,32 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         target_uid = int(data[12:])
         db_remove_user(target_uid)
         await q.answer("✅ تمت إزالة المستخدم")
-        # أعد عرض القائمة
         users = db_list_users()
-        text  = "👥 *المستخدمون:*\n"
+        text  = f"👥 *المستخدمون المصرح لهم*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        if not users:
+            text += "_(لا يوجد مستخدمون)_"
         for u in users:
             text += f"• `{u['user_id']}` — @{u['username'] or '—'}\n"
-        await q.edit_message_text(text or "_(فارغ)_", parse_mode="Markdown",
-                                  reply_markup=kb_users(users))
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb_users(users))
         return
 
     if data == "adm_sessions":
         if uid != ADMIN_ID:
             await q.answer("⛔️", show_alert=True); return
         rows = db_list_sessions()
-        text = "📋 *آخر الجلسات (كل المستخدمين):*\n\n"
+        text = f"📋 *آخر الجلسات — كل المستخدمين*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        if not rows:
+            text += "_(لا توجد جلسات)_"
         for r in rows:
             icon = "🟢" if r["status"] == "running" else "🔴"
-            text += f"{icon} `{r['tiktok_user']}` — 🏆`{r['total_score']:,}` — uid:`{r['user_id']}`\n"
-        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb_back("admin_panel"))
+            text += (
+                f"{icon} `{r['tiktok_user']}`\n"
+                f"   💰 `{r['total_score']:,}` | 📦 `{r['task_count']}` | uid:`{r['user_id']}`\n"
+            )
+        await q.edit_message_text(
+            text, parse_mode="Markdown",
+            reply_markup=kb_back("admin_panel", "🔙 رجوع للإدارة")
+        )
         return
 
     if data == "adm_stop_all":
@@ -800,8 +942,11 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     s.stop_flag = True
                     count += 1
         await q.edit_message_text(
-            f"⏹ *أُوقفت {count} جلسة.*",
-            parse_mode="Markdown", reply_markup=kb_back("admin_panel")
+            f"⏹ *تم إيقاف جميع الجلسات*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔴 عدد الجلسات المتوقفة: `{count}`",
+            parse_mode="Markdown",
+            reply_markup=kb_back("admin_panel", "🔙 رجوع للإدارة")
         )
         return
 
@@ -811,13 +956,15 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer("⛔️", show_alert=True); return
         ctx.user_data["awaiting"] = "adm_headers"
         await q.edit_message_text(
-            "🔧 *تحديث الهيدرز*\n\n"
-            "أرسل JSON يحتوي على المفاتيح المراد تحديثها، مثال:\n"
-            "```\n"
-            '{"x-app-sig":"...","x-app-ts":"...","x-app-nonce":"...","x-csrf-token":"..."}'
-            "\n```\n"
-            "سيتم تحديث الثلاث مجموعات تلقائياً.",
-            parse_mode="Markdown", reply_markup=kb_back("admin_panel")
+            f"🔧 *تحديث الهيدرز*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"أرسل JSON يحتوي على المفاتيح المراد تحديثها:\n"
+            f"```\n"
+            f'{{"x-app-sig":"...","x-app-ts":"...","x-app-nonce":"...","x-csrf-token":"..."}}'
+            f"\n```\n"
+            f"_(سيتم تحديث جميع مجموعات الهيدرز تلقائياً)_",
+            parse_mode="Markdown",
+            reply_markup=kb_back("admin_panel", "🔙 رجوع للإدارة")
         )
         return
 
@@ -826,7 +973,7 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if uid != ADMIN_ID:
             await q.answer("⛔️", show_alert=True); return
         speeds = db_get_speeds()
-        text   = "⚡ *السرعات المتاحة:*\n\n"
+        text   = f"⚡ *السرعات المتاحة*\n━━━━━━━━━━━━━━━━━━━━\n\n"
         for s in speeds:
             text += f"• `{s['id']}` — {s['label']} — `{s['value']}ث`\n"
         rows = [
@@ -842,8 +989,11 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer("⛔️", show_alert=True); return
         ctx.user_data["awaiting"] = "adm_add_speed_label"
         await q.edit_message_text(
-            "➕ أرسل *اسم السرعة* (مثال: `🚀 صاروخ 2`):",
-            parse_mode="Markdown", reply_markup=kb_back("adm_speeds")
+            f"➕ *إضافة سرعة جديدة*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"أرسل *اسم السرعة* (مثال: `🚀 صاروخ 2`):",
+            parse_mode="Markdown",
+            reply_markup=kb_back("adm_speeds", "🔙 رجوع للسرعات")
         )
         return
 
@@ -852,8 +1002,11 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer("⛔️", show_alert=True); return
         speeds = db_get_speeds()
         await q.edit_message_text(
-            "🗑 *اختر السرعة للحذف:*",
-            parse_mode="Markdown", reply_markup=kb_del_speed(speeds)
+            f"🗑 *حذف سرعة*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"اختر السرعة التي تريد حذفها:",
+            parse_mode="Markdown",
+            reply_markup=kb_del_speed(speeds)
         )
         return
 
@@ -865,10 +1018,14 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await q.answer("❌ خطأ"); return
         db_delete_speed(spid)
-        await q.answer("✅ حُذفت")
+        await q.answer("✅ حُذفت السرعة")
         speeds = db_get_speeds()
-        await q.edit_message_text("🗑 *السرعات المتبقية:*\n" + "\n".join(f"• {s['label']}" for s in speeds),
-                                  parse_mode="Markdown", reply_markup=kb_del_speed(speeds))
+        lines  = "\n".join(f"• {s['label']} — `{s['value']}ث`" for s in speeds) or "_(لا توجد سرعات)_"
+        await q.edit_message_text(
+            f"🗑 *السرعات المتبقية*\n━━━━━━━━━━━━━━━━━━━━\n\n{lines}",
+            parse_mode="Markdown",
+            reply_markup=kb_del_speed(speeds)
+        )
         return
 
     # ── تنزيل قاعدة البيانات ───────────────────
@@ -885,10 +1042,12 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer("⛔️", show_alert=True); return
         ctx.user_data["awaiting"] = "adm_upload_db"
         await q.edit_message_text(
-            "📤 *رفع قاعدة البيانات*\n\n"
-            "أرسل ملف `.db` وسيتم استبدال القاعدة الحالية.\n"
-            "⚠️ سيتم إيقاف جميع الجلسات النشطة أولاً.",
-            parse_mode="Markdown", reply_markup=kb_back("admin_panel")
+            f"📤 *رفع قاعدة البيانات*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"أرسل ملف `.db` وسيتم استبدال القاعدة الحالية.\n"
+            f"⚠️ سيتم إيقاف جميع الجلسات النشطة أولاً.",
+            parse_mode="Markdown",
+            reply_markup=kb_back("admin_panel", "🔙 رجوع للإدارة")
         )
         return
 
@@ -908,7 +1067,13 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if awaiting == "username":
         ctx.user_data["tiktok_username"] = text
         ctx.user_data["awaiting"]        = "password"
-        await update.message.reply_text("🔑 أرسل *كلمة المرور*:", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"🔑 *كلمة المرور*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 الحساب: `{text}`\n"
+            f"أرسل كلمة المرور الآن:",
+            parse_mode="Markdown"
+        )
         return
 
     # ── كلمة المرور → تسجيل دخول وبدء جلسة ──
@@ -916,10 +1081,26 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tiktok_user = ctx.user_data.pop("tiktok_username", "")
         password    = text
         ctx.user_data.pop("awaiting", None)
-        msg = await update.message.reply_text("🔄 *جارٍ تسجيل الدخول...*", parse_mode="Markdown")
+        msg = await update.message.reply_text(
+            f"🔄 *جارٍ تسجيل الدخول...*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 `{tiktok_user}`\n"
+            f"⏳ انتظر لحظة...",
+            parse_mode="Markdown"
+        )
         ok, info, token = login_account(tiktok_user, password)
         if not ok:
-            await msg.edit_text(f"{info}\nحاول مرة أخرى.", reply_markup=kb_main(uid))
+            await msg.edit_text(
+                f"❌ *فشل تسجيل الدخول*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"{info}\n\n"
+                f"تحقق من البيانات وحاول مرة أخرى.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 إعادة المحاولة", callback_data="new_session")],
+                    [InlineKeyboardButton("🔙 رجوع للرئيسية", callback_data="back_main")],
+                ])
+            )
             return
         speed = ctx.user_data.get("selected_speed", 0.2)
         db_id = db_save_session(uid, tiktok_user, token, speed)
@@ -938,9 +1119,16 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         thread.start()
         session.thread = thread
         await msg.edit_text(
-            f"✅ *تم تسجيل الدخول* | بدأت الجلسة\n"
-            f"👤 `{tiktok_user}` | ⚡ `{speed}ث`",
-            parse_mode="Markdown", reply_markup=kb_main(uid)
+            f"✅ *تم تسجيل الدخول بنجاح!*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 `{tiktok_user}`\n"
+            f"⚡ السرعة: `{speed}ث`\n"
+            f"🚀 *بدأت الجلسة — جارٍ الجمع...*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏹ إيقاف الجلسة", callback_data=f"stop_{sid}")],
+                [InlineKeyboardButton("📊 حالة الجلسات",  callback_data="my_status")],
+            ])
         )
         return
 
@@ -952,12 +1140,16 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             new_h = json.loads(text)
         except json.JSONDecodeError as e:
-            await update.message.reply_text(f"❌ JSON غير صالح: {e}", reply_markup=kb_admin())
+            await update.message.reply_text(
+                f"❌ *JSON غير صالح*\n`{e}`",
+                parse_mode="Markdown",
+                reply_markup=kb_back("admin_panel", "🔙 رجوع للإدارة")
+            )
             return
         keys = ["x-app-sig","x-app-ts","x-app-nonce","x-csrf-token","x-device-info",
                 "x-apollo-operation-id","User-Agent","token"]
         updated = []
-        for htype in ["login","fetch","action"]:
+        for htype in ["login","fetch","action","score"]:
             hdata = db_get_headers(htype)
             for k in keys:
                 if k in new_h:
@@ -966,8 +1158,11 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         updated.append(k)
             db_save_headers(htype, hdata)
         await update.message.reply_text(
-            f"✅ *تم تحديث الهيدرز*\nالمفاتيح المحدَّثة: `{', '.join(updated)}`",
-            parse_mode="Markdown", reply_markup=kb_admin()
+            f"✅ *تم تحديث الهيدرز*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"المفاتيح المحدَّثة:\n`{', '.join(updated)}`",
+            parse_mode="Markdown",
+            reply_markup=kb_back("admin_panel", "🔙 رجوع للإدارة")
         )
         return
 
@@ -976,20 +1171,24 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if uid != ADMIN_ID:
             return
         ctx.user_data.pop("awaiting", None)
-        # قبول ID رقمي أو @username (يحتاج resolve - هنا نخزن كما هو)
         raw = text.lstrip("@")
         try:
             target_uid = int(raw)
             db_add_user(target_uid, "", uid)
             await update.message.reply_text(
-                f"✅ أُضيف المستخدم `{target_uid}`",
-                parse_mode="Markdown", reply_markup=kb_admin()
+                f"✅ *تمت الإضافة*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"المستخدم `{target_uid}` أُضيف بنجاح.",
+                parse_mode="Markdown",
+                reply_markup=kb_back("adm_users", "🔙 رجوع للمستخدمين")
             )
         except ValueError:
             await update.message.reply_text(
-                "⚠️ أرسل معرف رقمي (ID) فقط.\n"
-                "يمكنك الحصول عليه من @userinfobot",
-                reply_markup=kb_admin()
+                f"⚠️ *خطأ في الإدخال*\n"
+                f"أرسل معرف رقمي (ID) فقط.\n"
+                f"يمكنك الحصول عليه من @userinfobot",
+                parse_mode="Markdown",
+                reply_markup=kb_back("adm_users", "🔙 رجوع")
             )
         return
 
@@ -1000,7 +1199,9 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["new_speed_label"] = text
         ctx.user_data["awaiting"]        = "adm_add_speed_value"
         await update.message.reply_text(
-            f"⚡ اسم السرعة: *{text}*\n\nأرسل الآن *القيمة بالثواني* (مثال: `0.01`):",
+            f"⚡ *اسم السرعة:* `{text}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"أرسل الآن *القيمة بالثواني* (مثال: `0.01`):",
             parse_mode="Markdown"
         )
         return
@@ -1016,12 +1217,20 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if val <= 0:
                 raise ValueError
         except ValueError:
-            await update.message.reply_text("❌ قيمة غير صالحة.", reply_markup=kb_admin())
+            await update.message.reply_text(
+                "❌ *قيمة غير صالحة*\nأرسل رقماً موجباً مثل `0.01`",
+                parse_mode="Markdown",
+                reply_markup=kb_back("adm_speeds", "🔙 رجوع للسرعات")
+            )
             return
         db_add_speed(label, val)
         await update.message.reply_text(
-            f"✅ أُضيفت السرعة: *{label}* `({val}ث)`",
-            parse_mode="Markdown", reply_markup=kb_admin()
+            f"✅ *تمت إضافة السرعة*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"الاسم: *{label}*\n"
+            f"القيمة: `{val}ث`",
+            parse_mode="Markdown",
+            reply_markup=kb_back("adm_speeds", "🔙 رجوع للسرعات")
         )
         return
 
