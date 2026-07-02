@@ -27,7 +27,7 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "8287678319"))
 API_URL = "https://api.tikspark.xyz/graphql"
 
 # ============================================================
-#                     📦 الهيدرز الثابتة (قابلة للتحديث)
+#                     📦 الهيدرز الثابتة
 # ============================================================
 LOGIN_HEADERS = {
     "User-Agent": "okhttp/4.12.0",
@@ -86,7 +86,6 @@ Path(BACKUP_DIR).mkdir(exist_ok=True)
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # جدول المستخدمين
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -94,7 +93,6 @@ def init_db():
             is_admin INTEGER DEFAULT 0
         )
     ''')
-    # جدول الجلسات
     c.execute('''
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,7 +110,6 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users (user_id)
         )
     ''')
-    # جدول سرعات مخصصة (للإدمن)
     c.execute('''
         CREATE TABLE IF NOT EXISTS speed_presets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,7 +118,6 @@ def init_db():
             display_order INTEGER
         )
     ''')
-    # إضافة سرعات افتراضية إن لم توجد
     default_speeds = [(0.005, '🚀 خارقة', 1),
                       (0.02, '⚡ سريعة جداً', 2),
                       (0.05, '🔥 سريعة', 3),
@@ -140,9 +136,6 @@ init_db()
 def get_db_conn():
     return sqlite3.connect(DB_PATH)
 
-# ============================================================
-#                     📦 دوال قاعدة البيانات
-# ============================================================
 def add_user(user_id, username):
     conn = get_db_conn()
     c = conn.cursor()
@@ -225,7 +218,7 @@ def delete_speed_preset(speed):
     conn.close()
 
 # ============================================================
-#                     🔐 دوال تسجيل الدخول والجمع (نفس الأصل)
+#                     🔐 دوال تسجيل الدخول والجمع
 # ============================================================
 
 def login_account(username, password):
@@ -334,18 +327,14 @@ def execute_order(token, order_id):
         return None
 
 # ============================================================
-#                     🧵 حلقة الجمع (لكل جلسة)
+#                     🧵 حلقة الجمع
 # ============================================================
 def collector_loop(session_id, bot, chat_id):
-    """حلقة جمع النقاط لجلسة معينة (تقرأ البيانات من قاعدة البيانات)"""
-    # نأخذ البيانات الأولية
     session_data = get_session(session_id)
     if not session_data:
         return
-    # session_data: (id, user_id, tiktok_username, token, speed, is_running, total_score, task_count, errors, last_score, start_time, status_msg_id)
     token = session_data[3]
     speed = session_data[4]
-    # تحديث حالة التشغيل
     update_session(session_id, is_running=1)
     last_score = session_data[9]
 
@@ -364,9 +353,8 @@ def collector_loop(session_id, bot, chat_id):
 
     consecutive_errors = 0
     while True:
-        # نتحقق من حالة الإيقاف (نقرأ is_running من قاعدة البيانات)
         current = get_session(session_id)
-        if not current or current[5] == 0:  # is_running = 0
+        if not current or current[5] == 0:
             break
         try:
             order_id = fetch_order_id(token)
@@ -400,28 +388,26 @@ def collector_loop(session_id, bot, chat_id):
             consecutive_errors = 0
             score = result.get("score", last_score)
             progress = result.get("taskProgress", {})
-            count = progress.get("count", session_data[7])  # task_count
+            count = progress.get("count", session_data[7])
 
             if score < last_score:
                 score = last_score
 
             gained = max(0, score - last_score)
             last_score = score
-            # تحديث قاعدة البيانات
             update_session(session_id, total_score=score, task_count=count, last_score=last_score)
 
             bar = "█" * min(count, 10) + "░" * (10 - min(count, 10))
             status = "⏳ تقدم" if gained == 0 else f"🎉 +{gained}"
 
             text = (
-                f"📊 *{current[2]}*\n"  # tiktok_username
+                f"📊 *{current[2]}*\n"
                 f"{status} | [{bar}] {count}/∞\n"
                 f"🏆 الإجمالي: `{score:,}`\n"
                 f"⚡ السرعة: {speed}ث"
             )
             send_update(text)
 
-            # نقرأ السرعة من قاعدة البيانات لتحديثها إن تغيرت
             updated = get_session(session_id)
             speed = updated[4] if updated else speed
             time.sleep(speed)
@@ -437,17 +423,15 @@ def collector_loop(session_id, bot, chat_id):
     update_session(session_id, is_running=0)
     final = get_session(session_id)
     if final:
-        send_update(f"🏁 *انتهت الجلسة*\n🏆 النهائي: `{final[6]:,}`")  # total_score
+        send_update(f"🏁 *انتهت الجلسة*\n🏆 النهائي: `{final[6]:,}`")
 
 # ============================================================
-#                     ⌨️ أزرار البوت (تصميم عصري)
+#                     ⌨️ أزرار البوت
 # ============================================================
 
 def main_keyboard(user_id):
-    """القائمة الرئيسية مع أزرار منظمة"""
-    # نتحقق من وجود جلسات لهذا المستخدم
     sessions = get_sessions_by_user(user_id)
-    has_running = any(s[5] == 1 for s in sessions)  # is_running
+    has_running = any(s[5] == 1 for s in sessions)
     keyboard = [
         [InlineKeyboardButton("▶️ بدء جلسة جديدة", callback_data="new_session")],
     ]
@@ -461,7 +445,6 @@ def main_keyboard(user_id):
     return InlineKeyboardMarkup(keyboard)
 
 def admin_keyboard():
-    """لوحة تحكم الإدمن"""
     keyboard = [
         [InlineKeyboardButton("📋 كل الجلسات", callback_data="list_all_sessions")],
         [InlineKeyboardButton("⚡ إدارة السرعات", callback_data="manage_speeds")],
@@ -473,7 +456,6 @@ def admin_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def speed_keyboard(user_id):
-    """عرض السرعات المتاحة للمستخدم"""
     presets = get_speed_presets()
     buttons = []
     for speed, label in presets:
@@ -482,7 +464,6 @@ def speed_keyboard(user_id):
     return InlineKeyboardMarkup(buttons)
 
 def manage_speeds_keyboard():
-    """لوحة إدارة السرعات للإدمن"""
     presets = get_speed_presets()
     buttons = []
     for speed, label in presets:
@@ -494,8 +475,6 @@ def manage_speeds_keyboard():
 # ============================================================
 #                     📨 معالجات البوت
 # ============================================================
-
-# حالات المحادثة
 AWAITING_USERNAME, AWAITING_PASSWORD, AWAITING_HEADERS, AWAITING_SPEED_NAME, AWAITING_SPEED_VALUE, AWAITING_RESTORE = range(6)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -503,12 +482,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     username = user.username or user.first_name
     add_user(user_id, username)
-
-    # نتحقق من وجود جلسات نشطة
     await update.message.reply_text(
-        f"👋 مرحباً {username}!\n\n"
-        "🚀 *بوت TikSpark*\n"
-        "استخدم الأزرار للتحكم بجلساتك.",
+        f"👋 مرحباً {username}!\n\n🚀 *بوت TikSpark*\nاستخدم الأزرار للتحكم بجلساتك.",
         parse_mode="Markdown",
         reply_markup=main_keyboard(user_id)
     )
@@ -520,7 +495,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     chat_id = update.effective_chat.id
 
-    # ----- القائمة الرئيسية -----
     if data == "new_session":
         await query.edit_message_text(
             "👤 أرسل *اسم المستخدم* (TikTok):",
@@ -535,7 +509,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not running:
             await query.edit_message_text("⚠️ لا توجد جلسة نشطة.", reply_markup=main_keyboard(user_id))
             return
-        # نوقف الجلسة الأولى (الأحدث)
         session_id = running[0][0]
         update_session(session_id, is_running=0)
         await query.edit_message_text(
@@ -550,7 +523,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not sessions:
             await query.edit_message_text("📭 لا توجد جلسات.", reply_markup=main_keyboard(user_id))
             return
-        # نأخذ آخر جلسة
         session = sessions[-1]
         status = "🟢 تعمل" if session[5] == 1 else "🔴 متوقفة"
         text = (
@@ -592,7 +564,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not sessions:
             await query.edit_message_text("⚠️ لا توجد جلسة لتعديل سرعتها.", reply_markup=main_keyboard(user_id))
             return
-        # نطبق على آخر جلسة
         session_id = sessions[-1][0]
         update_session(session_id, speed=speed)
         await query.edit_message_text(
@@ -602,14 +573,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ----- لوحة الإدمن -----
+    # Admin panel
     if user_id == ADMIN_ID:
         if data == "admin_panel":
-            await query.edit_message_text(
-                "⚙️ *لوحة الإدارة*",
-                parse_mode="Markdown",
-                reply_markup=admin_keyboard()
-            )
+            await query.edit_message_text("⚙️ *لوحة الإدارة*", parse_mode="Markdown", reply_markup=admin_keyboard())
             return
 
         if data == "list_all_sessions":
@@ -625,27 +592,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data == "manage_speeds":
-            await query.edit_message_text(
-                "⚡ *إدارة السرعات*",
-                parse_mode="Markdown",
-                reply_markup=manage_speeds_keyboard()
-            )
+            await query.edit_message_text("⚡ *إدارة السرعات*", parse_mode="Markdown", reply_markup=manage_speeds_keyboard())
             return
 
         if data.startswith("del_speed_"):
             speed = float(data.split("_")[2])
             delete_speed_preset(speed)
-            await query.edit_message_text(
-                f"✅ تم حذف السرعة `{speed}ث`",
-                parse_mode="Markdown",
-                reply_markup=manage_speeds_keyboard()
-            )
+            await query.edit_message_text(f"✅ تم حذف السرعة `{speed}ث`", parse_mode="Markdown", reply_markup=manage_speeds_keyboard())
             return
 
         if data == "add_speed":
             await query.edit_message_text(
-                "✏️ أرسل *السرعة* (رقم عشري) أولاً، ثم في الرسالة التالية أرسل *الاسم*.\n"
-                "مثال: `0.1` ثم `⚡ سريع`",
+                "✏️ أرسل *السرعة* (رقم عشري) أولاً، ثم في الرسالة التالية أرسل *الاسم*.\nمثال: `0.1` ثم `⚡ سريع`",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="admin_panel")]])
             )
@@ -653,7 +611,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data == "backup_db":
-            # إرسال قاعدة البيانات
             backup_path = BACKUP_DIR + "/backup_latest.sqlite"
             shutil.copy(DB_PATH, backup_path)
             with open(backup_path, 'rb') as f:
@@ -673,29 +630,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "update_headers":
             await query.edit_message_text(
                 "🔧 أرسل الهيدرز الجديدة على شكل JSON.\n"
-                "مثال:\n"
-                "```json\n"
-                "{\n"
-                "  \"x-app-sig\": \"new_sig\",\n"
-                "  \"x-app-ts\": \"new_ts\",\n"
-                "  \"x-app-nonce\": \"new_nonce\",\n"
-                "  \"x-csrf-token\": \"new_token\"\n"
-                "}\n"
-                "```\n"
-                "سيتم تحديث جميع الهيدرز تلقائياً.",
+                "مثال:\n```json\n{\n  \"x-app-sig\": \"new_sig\",\n  \"x-app-ts\": \"new_ts\",\n  \"x-app-nonce\": \"new_nonce\",\n  \"x-csrf-token\": \"new_token\"\n}\n```\nسيتم تحديث جميع الهيدرز.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="admin_panel")]])
             )
             context.user_data["awaiting_headers"] = True
             return
 
-    # ----- رجوع -----
     if data == "back_main":
-        await query.edit_message_text(
-            "🚀 *القائمة الرئيسية*",
-            parse_mode="Markdown",
-            reply_markup=main_keyboard(user_id)
-        )
+        await query.edit_message_text("🚀 *القائمة الرئيسية*", parse_mode="Markdown", reply_markup=main_keyboard(user_id))
         return
 
     if data == "cancel":
@@ -709,7 +652,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     chat_id = update.effective_chat.id
 
-    # معالجة استقبال اسم المستخدم وكلمة المرور
     if context.user_data.get("awaiting") == "username":
         context.user_data["username"] = text
         context.user_data["awaiting"] = "password"
@@ -731,9 +673,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop("username", None)
             return
 
-        # إنشاء جلسة في قاعدة البيانات
         session_id = add_session(user_id, username, token)
-        # بدء خيط الجمع
         bot = context.bot
         thread = threading.Thread(target=collector_loop, args=(session_id, bot, chat_id), daemon=True)
         thread.start()
@@ -747,37 +687,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("username", None)
         return
 
-    # معالجة تحديث الهيدرز
     if context.user_data.get("awaiting_headers"):
         try:
             new_headers = json.loads(text)
             global LOGIN_HEADERS, FETCH_HEADERS, ACTION_HEADERS_TEMPLATE
-            # تحديث جميع الهيدرز بالحقول الموجودة
             for key in ["x-app-sig", "x-app-ts", "x-app-nonce", "x-csrf-token"]:
                 if key in new_headers:
                     val = new_headers[key]
                     LOGIN_HEADERS[key] = val
                     FETCH_HEADERS[key] = val
                     ACTION_HEADERS_TEMPLATE[key] = val
-            await update.message.reply_text(
-                "✅ تم تحديث الهيدرز بنجاح!",
-                reply_markup=admin_keyboard()
-            )
+            await update.message.reply_text("✅ تم تحديث الهيدرز بنجاح!", reply_markup=admin_keyboard())
         except Exception as e:
             await update.message.reply_text(f"❌ خطأ في JSON: {e}")
         context.user_data.pop("awaiting_headers", None)
         return
 
-    # معالجة إضافة سرعة جديدة
     if context.user_data.get("add_speed_step") == "value":
         try:
             speed = float(text)
             context.user_data["new_speed"] = speed
             context.user_data["add_speed_step"] = "label"
-            await update.message.reply_text(
-                "✏️ الآن أرسل *اسم* هذه السرعة (مثل: 🚀 خارقة):",
-                parse_mode="Markdown"
-            )
+            await update.message.reply_text("✏️ الآن أرسل *اسم* هذه السرعة:", parse_mode="Markdown")
         except ValueError:
             await update.message.reply_text("❌ قيمة غير صالحة. أرسل رقماً عشرياً.")
         return
@@ -789,36 +720,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ حدث خطأ، ابدأ من جديد.")
             context.user_data.pop("add_speed_step", None)
             return
-        # نضيف السرعة بترتيب تلقائي (آخر)
         conn = get_db_conn()
         c = conn.cursor()
         c.execute('SELECT MAX(display_order) FROM speed_presets')
         max_order = c.fetchone()[0] or 0
         add_speed_preset(speed, label, max_order + 1)
         conn.close()
-        await update.message.reply_text(
-            f"✅ تم إضافة السرعة `{speed}ث` باسم `{label}`",
-            reply_markup=admin_keyboard()
-        )
+        await update.message.reply_text(f"✅ تم إضافة السرعة `{speed}ث` باسم `{label}`", reply_markup=admin_keyboard())
         context.user_data.pop("add_speed_step", None)
         context.user_data.pop("new_speed", None)
         return
 
-    # معالجة استعادة قاعدة البيانات
     if context.user_data.get("awaiting_restore"):
         if update.message.document:
             file = await update.message.document.get_file()
             file_path = "restored.sqlite"
             await file.download_to_drive(file_path)
-            # استبدال قاعدة البيانات الحالية
             shutil.copy(file_path, DB_PATH)
             os.remove(file_path)
-            await update.message.reply_text(
-                "✅ تم استعادة قاعدة البيانات بنجاح!",
-                reply_markup=admin_keyboard()
-            )
+            await update.message.reply_text("✅ تم استعادة قاعدة البيانات!", reply_markup=admin_keyboard())
         else:
-            await update.message.reply_text("❌ أرسل ملف قاعدة البيانات بصيغة .sqlite")
+            await update.message.reply_text("❌ أرسل ملف قاعدة بيانات بصيغة .sqlite")
         context.user_data.pop("awaiting_restore", None)
         return
 
@@ -828,7 +750,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #                     ⏰ النسخ الاحتياطي التلقائي
 # ============================================================
 def auto_backup(context):
-    """تُرسل نسخة احتياطية إلى الإدمن كل 30 دقيقة مع ترقيم"""
     backup_count_file = BACKUP_DIR + "/backup_count.txt"
     if os.path.exists(backup_count_file):
         with open(backup_count_file, 'r') as f:
@@ -840,21 +761,18 @@ def auto_backup(context):
     backup_path = BACKUP_DIR + "/" + backup_name
     shutil.copy(DB_PATH, backup_path)
 
-    # إرسال الملف للإدمن
     try:
         with open(backup_path, 'rb') as f:
             context.bot.send_document(chat_id=ADMIN_ID, document=f, filename=backup_name)
     except Exception as e:
         logging.error(f"فشل إرسال النسخة الاحتياطية: {e}")
 
-    # حذف النسخة السابقة (إن وجدت)
     prev_count = count - 1
     if prev_count >= 1:
         prev_path = BACKUP_DIR + f"/backup_{prev_count}.sqlite"
         if os.path.exists(prev_path):
             os.remove(prev_path)
 
-    # تحديث العداد
     count += 1
     with open(backup_count_file, 'w') as f:
         f.write(str(count))
@@ -864,17 +782,14 @@ def auto_backup(context):
 # ============================================================
 
 def main():
-    # تهيئة السجلات
     logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # إضافة معالجات الأوامر والأزرار
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_message))  # لاستقبال الملفات
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_message))
 
-    # جدولة النسخ الاحتياطي التلقائي كل 30 دقيقة
     job_queue = app.job_queue
     if job_queue:
         job_queue.run_repeating(auto_backup, interval=timedelta(minutes=30), first=60)
